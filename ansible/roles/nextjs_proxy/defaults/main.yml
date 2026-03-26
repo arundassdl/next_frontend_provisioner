@@ -1,0 +1,8 @@
+---
+site_name: ""
+safe_name: ""
+container_port: 3000
+app_server_private_ip: ""
+press_callback_url: ""
+press_callback_token: ""
+playbook_action: "provision"

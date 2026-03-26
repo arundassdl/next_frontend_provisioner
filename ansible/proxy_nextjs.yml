@@ -1,0 +1,21 @@
+---
+# Provisions or updates a Next.js upstream on all Press proxy servers.
+# Invoked by agent_extension/proxy_manager.py with extra vars injected via -e.
+#
+# Required extra vars:
+#   site_name             e.g. mysite.frappe.cloud
+#   safe_name             e.g. mysite_frappe_cloud
+#   container_port        e.g. 3100
+#   app_server_private_ip e.g. 10.0.1.12
+#   press_callback_url    e.g. https://press.internal/api/method/...
+#   press_callback_token  Frappe API token string
+
+- name: Provision Next.js proxy upstream
+  hosts: proxies
+  become: yes
+  gather_facts: yes
+
+  roles:
+    - role: nextjs_proxy
+      vars:
+        playbook_action: provision

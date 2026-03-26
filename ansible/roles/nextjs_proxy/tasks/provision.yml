@@ -1,0 +1,70 @@
+---
+- name: Ensure nginx conf.d directory exists
+  ansible.builtin.file:
+    path: "{{ nginx_conf_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render Next.js upstream config from template
+  ansible.builtin.template:
+    src: nextjs_proxy.conf.j2
+    dest: "{{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: yes
+  notify: reload nginx
+
+- name: Check SSL certificate exists
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ site_name }}/fullchain.pem"
+  register: ssl_cert
+
+- name: Warn if SSL certificate is missing
+  ansible.builtin.debug:
+    msg: >
+      SSL certificate not found for {{ site_name }}.
+      nginx reload will fail. Run: certbot certonly --nginx -d {{ site_name }}
+  when: not ssl_cert.stat.exists
+
+- name: Test nginx configuration
+  ansible.builtin.command: nginx -t
+  register: nginx_test
+  changed_when: false
+  failed_when: nginx_test.rc != 0
+
+- name: Reload nginx
+  ansible.builtin.service:
+    name: "{{ nginx_service }}"
+    state: reloaded
+  when: nginx_test.rc == 0
+
+- name: Verify upstream is reachable from proxy
+  ansible.builtin.uri:
+    url: "http://{{ app_server_private_ip }}:{{ container_port }}/api/health"
+    method: GET
+    status_code: 200
+    timeout: 10
+  register: health_check
+  retries: 6
+  delay: 5
+  until: health_check.status == 200
+
+- name: POST result back to Press controller
+  ansible.builtin.uri:
+    url: "{{ press_callback_url }}"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "token {{ press_callback_token }}"
+    body_format: json
+    body:
+      job_name: "Provision Next.js Site"
+      site: "{{ site_name }}"
+      status: "{{ 'Success' if health_check.status == 200 else 'Failure' }}"
+      output: "nginx reloaded and upstream verified"
+    status_code: [200, 201]
+  when: press_callback_url != ""
+  ignore_errors: yes

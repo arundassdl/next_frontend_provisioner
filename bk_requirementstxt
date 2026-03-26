@@ -1,0 +1,4 @@
+frappe
+docker==6.1.2
+requests>=2.31.0
+ansible>=8.0.0

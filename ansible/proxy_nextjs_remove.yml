@@ -1,0 +1,10 @@
+---
+- name: Remove Next.js proxy upstream
+  hosts: proxies
+  become: yes
+  gather_facts: no
+
+  roles:
+    - role: nextjs_proxy
+      vars:
+        playbook_action: remove

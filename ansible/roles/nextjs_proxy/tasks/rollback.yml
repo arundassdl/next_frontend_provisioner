@@ -1,0 +1,31 @@
+---
+- name: Check backup config exists
+  ansible.builtin.stat:
+    path: "{{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf~"
+  register: backup_conf
+
+- name: Restore previous nginx config from backup
+  ansible.builtin.copy:
+    src: "{{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf~"
+    dest: "{{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  when: backup_conf.stat.exists
+
+- name: Fail if no backup available
+  ansible.builtin.fail:
+    msg: "No backup config found at {{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf~"
+  when: not backup_conf.stat.exists
+
+- name: Test nginx after rollback
+  ansible.builtin.command: nginx -t
+  register: nginx_test_rollback
+  changed_when: false
+  failed_when: nginx_test_rollback.rc != 0
+
+- name: Reload nginx after rollback
+  ansible.builtin.service:
+    name: "{{ nginx_service }}"
+    state: reloaded

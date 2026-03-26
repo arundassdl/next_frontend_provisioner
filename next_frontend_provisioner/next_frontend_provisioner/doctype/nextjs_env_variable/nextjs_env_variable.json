@@ -1,0 +1,32 @@
+{
+  "name": "Nextjs Env Variable",
+  "doctype": "DocType",
+  "module": "Next Frontend Provisioner",
+  "istable": 1,
+  "fields": [
+    {
+      "fieldname": "key",
+      "fieldtype": "Data",
+      "label": "Key",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "value",
+      "fieldtype": "Password",
+      "label": "Value",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "variable_type",
+      "fieldtype": "Select",
+      "label": "Type",
+      "options": "Runtime\nBuild",
+      "default": "Runtime",
+      "in_list_view": 1,
+      "description": "Runtime=docker run -e. Build=--build-arg (NEXT_PUBLIC_*)."
+    }
+  ],
+  "permissions": []
+}

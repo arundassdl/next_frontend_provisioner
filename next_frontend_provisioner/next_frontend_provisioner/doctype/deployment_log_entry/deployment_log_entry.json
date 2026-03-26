@@ -1,0 +1,30 @@
+{
+  "name": "Deployment Log Entry",
+  "doctype": "DocType",
+  "module": "Next Frontend Provisioner",
+  "istable": 1,
+  "fields": [
+    {
+      "fieldname": "timestamp",
+      "fieldtype": "Data",
+      "label": "Timestamp",
+      "in_list_view": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "level",
+      "fieldtype": "Select",
+      "label": "Level",
+      "options": "Info\nWarning\nError",
+      "default": "Info",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "message",
+      "fieldtype": "Long Text",
+      "label": "Message",
+      "in_list_view": 1
+    }
+  ],
+  "permissions": []
+}

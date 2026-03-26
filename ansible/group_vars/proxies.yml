@@ -1,0 +1,12 @@
+---
+nginx_conf_dir: /etc/nginx/conf.d
+nginx_service: nginx
+nginx_user: www-data
+
+press_controller_url: "{{ lookup('env', 'PRESS_CONTROLLER_URL') }}"
+press_agent_token: "{{ lookup('env', 'PRESS_AGENT_TOKEN') }}"
+
+nextjs_proxy_read_timeout: 60
+nextjs_proxy_connect_timeout: 10
+nextjs_keepalive_connections: 32
+nextjs_static_cache_days: 365

@@ -1,0 +1,3 @@
+---
+- name: Include provision or remove tasks
+  ansible.builtin.include_tasks: "{{ playbook_action }}.yml"

@@ -1,0 +1,33 @@
+---
+- name: Remove Next.js upstream config file
+  ansible.builtin.file:
+    path: "{{ nginx_conf_dir }}/{{ site_name }}.nextjs.conf"
+    state: absent
+
+- name: Test nginx after config removal
+  ansible.builtin.command: nginx -t
+  register: nginx_test_remove
+  changed_when: false
+  failed_when: nginx_test_remove.rc != 0
+
+- name: Reload nginx after removal
+  ansible.builtin.service:
+    name: "{{ nginx_service }}"
+    state: reloaded
+
+- name: POST teardown result to Press controller
+  ansible.builtin.uri:
+    url: "{{ press_callback_url }}"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "token {{ press_callback_token }}"
+    body_format: json
+    body:
+      job_name: "Teardown Next.js Site"
+      site: "{{ site_name }}"
+      status: "Success"
+      output: "nginx config removed and reloaded"
+    status_code: [200, 201]
+  when: press_callback_url != ""
+  ignore_errors: yes

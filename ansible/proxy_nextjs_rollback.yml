@@ -1,0 +1,10 @@
+---
+- name: Rollback Next.js proxy upstream to previous config
+  hosts: proxies
+  become: yes
+  gather_facts: no
+
+  roles:
+    - role: nextjs_proxy
+      vars:
+        playbook_action: rollback

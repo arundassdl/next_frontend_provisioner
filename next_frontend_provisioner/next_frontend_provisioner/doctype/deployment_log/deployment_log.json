@@ -1,0 +1,29 @@
+{
+  "name": "Deployment Log",
+  "doctype": "DocType",
+  "module": "Next Frontend Provisioner",
+  "autoname": "hash",
+  "fields": [
+    {
+      "fieldname": "site",
+      "fieldtype": "Link",
+      "label": "Site",
+      "options": "Nextjs Site",
+      "reqd": 1
+    },
+    {
+      "fieldname": "log_entries",
+      "fieldtype": "Table",
+      "label": "Log Entries",
+      "options": "Deployment Log Entry"
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1
+    }
+  ]
+}

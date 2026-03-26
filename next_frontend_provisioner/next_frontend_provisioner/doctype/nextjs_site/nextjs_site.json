@@ -1,0 +1,101 @@
+{
+  "name": "Nextjs Site",
+  "doctype": "DocType",
+  "module": "Next Frontend Provisioner",
+  "autoname": "field:site_name",
+  "title_field": "site_name",
+  "fields": [
+    {
+      "fieldname": "site_name",
+      "fieldtype": "Data",
+      "label": "Site Name",
+      "reqd": 1,
+      "unique": 1,
+      "description": "Frontend hostname (e.g. crm.yourdomain.com). For Full Stack mode this must match a Press Site name. For Frontend Only mode this is the domain the Next.js container will serve."
+    },
+    {
+      "fieldname": "deployment_mode",
+      "fieldtype": "Select",
+      "label": "Deployment Mode",
+      "options": "Full Stack\nFrontend Only",
+      "default": "Full Stack",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Full Stack provisions a new Frappe backend. Frontend Only deploys the Next.js container only, proxying API calls to an existing backend."
+    },
+    {
+      "fieldname": "backend_url",
+      "fieldtype": "Data",
+      "label": "Backend URL",
+      "description": "Existing Frappe backend to proxy /api/* to, e.g. https://crmapp.yourdomain.com",
+      "depends_on": "eval:doc.deployment_mode=='Frontend Only'",
+      "mandatory_depends_on": "eval:doc.deployment_mode=='Frontend Only'"
+    },
+    {
+      "fieldname": "repo_url",
+      "fieldtype": "Data",
+      "label": "Repository URL",
+      "reqd": 1
+    },
+    {
+      "fieldname": "branch",
+      "fieldtype": "Data",
+      "label": "Branch",
+      "default": "main"
+    },
+    {
+      "fieldname": "col_break_1",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Pending\nRunning\nDeploying\nFailed\nStopped",
+      "default": "Pending",
+      "read_only": 1
+    },
+    {
+      "fieldname": "container_port",
+      "fieldtype": "Int",
+      "label": "Container Port",
+      "read_only": 1,
+      "description": "Auto-allocated host port starting at 3100"
+    },
+    {
+      "fieldname": "agent_job",
+      "fieldtype": "Data",
+      "label": "Agent Job ID",
+      "read_only": 1
+    },
+    {
+      "fieldname": "target_server",
+      "fieldtype": "Link",
+      "label": "Target Server",
+      "options": "Server",
+      "description": "Press Application Server where the Next.js container will run. Required for Frontend Only mode. Full Stack mode auto-resolves from the linked Press Site if left blank.",
+      "depends_on": "eval:doc.deployment_mode=='Frontend Only'",
+      "mandatory_depends_on": "eval:doc.deployment_mode=='Frontend Only'"
+    },
+    {
+      "fieldname": "section_env",
+      "fieldtype": "Section Break",
+      "label": "Environment Variables"
+    },
+    {
+      "fieldname": "env_variables",
+      "fieldtype": "Table",
+      "label": "Environment Variables",
+      "options": "Nextjs Env Variable"
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ]
+}

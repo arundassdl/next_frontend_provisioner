@@ -1,0 +1,4 @@
+include requirements.txt
+recursive-include next_frontend_provisioner *.json *.js *.css *.html *.txt *.md *.conf *.j2 *.py *.ts *.ini *.yml *.yaml
+recursive-include ansible *.yml *.yaml *.j2 *.ini
+recursive-include agent_extension *.py
