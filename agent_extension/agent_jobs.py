@@ -1,22 +1,24 @@
 """
-agent_jobs.py  →  copy to agent/nextjs_jobs.py in your frappe/agent fork
-------------------------------------------------------------------------
-Three job classes registered with the Press agent:
-  - ProvisionNextjsSiteJob
-  - TeardownNextjsSiteJob
-  - RedeployNextjsSiteJob  (blue/green zero-downtime)
+agent_jobs.py  →  copy to agent/nextjs_jobs.py
+-----------------------------------------------
+Mixin for frappe/agent's Server class.
+Adds three @job methods that Press can dispatch:
+  - provision_nextjs_site   ("Provision Next.js Site")
+  - teardown_nextjs_site    ("Teardown Next.js Site")
+  - redeploy_nextjs_site    ("Redeploy Next.js Site")
 
-Register in agent/job.py:
-    from agent.nextjs_jobs import (
-        ProvisionNextjsSiteJob, TeardownNextjsSiteJob, RedeployNextjsSiteJob
-    )
-    JOB_CLASSES = {
-        **JOB_CLASSES,
-        "Provision Next.js Site": ProvisionNextjsSiteJob,
-        "Teardown Next.js Site":  TeardownNextjsSiteJob,
-        "Redeploy Next.js Site":  RedeployNextjsSiteJob,
-    }
+Wire into agent/server.py:
+
+    from agent.nextjs_jobs import NextjsMixin
+
+    class Server(NextjsMixin, Base):
+        ...
+
+The existing Server(Base) becomes Server(NextjsMixin, Base).
+MRO keeps Base last so nothing breaks.
 """
+from __future__ import annotations
+
 import os
 import subprocess
 import time
@@ -24,15 +26,17 @@ import time
 import docker
 import requests
 
+from agent.job import job, step
 
-# ── Shared helpers ────────────────────────────────────────────────────
+
+# ── Shared helpers (module-level, no self needed) ─────────────────────
 
 def _client():
     return docker.from_env()
 
 
 def _cname(site_name: str) -> str:
-    return f"nextjs_{site_name.replace('.', '_')}"
+    return f"nextjs_{site_name.replace('.', '_').replace('-', '_')}"
 
 
 def _ensure_cache_dir(site_name: str) -> str:
@@ -65,72 +69,155 @@ def _wait_healthy(url: str, retries: int = 20, delay: float = 5.0):
     raise RuntimeError(f"Container not healthy after {retries * delay:.0f}s — {url}")
 
 
-def _write_nginx(site_name: str, container_name: str, port: int):
-    from agent.nginx_utils import write_upstream
-    write_upstream(site_name, container_name, port)
+# ── Mixin ─────────────────────────────────────────────────────────────
 
+class NextjsMixin:
+    """
+    Drop-in mixin for agent/server.py's Server class.
+    Provides three Press-dispatchable Next.js deployment jobs.
+    """
 
-# ── Provision ─────────────────────────────────────────────────────────
+    # ── Provision ─────────────────────────────────────────────────────
 
-class ProvisionNextjsSiteJob:
-    job_type = "Provision Next.js Site"
-
-    def __init__(self, job, server):
-        self.job    = job
-        self.server = server
-        self.params = job.get("params", {})
-
-    def run(self):
-        site   = self.job["site"]
-        p      = self.params
-        port   = p["container_port"]
-        name   = _cname(site)
-
-        repo_dir  = self._clone(site, p)
-        self._inject_templates(repo_dir, site, p)
-        tag       = self._build(name, repo_dir, p)
+    @job("Provision Next.js Site")
+    def provision_nextjs_site(
+        self, site, repo_url, branch, container_port, env_vars,
+        build_args=None, deployment_mode="Full Stack", backend_url="",
+        app_server_private_ip="", proxy_hosts=None,
+        press_callback_url="", press_callback_token="",
+    ):
+        name      = _cname(site)
+        repo_dir  = self._nextjs_clone(site, repo_url, branch)
+        self._nextjs_inject_templates(repo_dir, site, env_vars)
+        tag       = self._nextjs_build(name, repo_dir, build_args or {})
         cache_dir = _ensure_cache_dir(site)
-        self._start(name, tag, port, p["env_vars"], cache_dir)
-        _wait_healthy(f"http://localhost:{port}/api/health")
-        _write_nginx(site, name, port)
-        self._push_proxy(site, port, p)
+        self._nextjs_start_container(name, tag, container_port, env_vars, cache_dir)
+        self._nextjs_wait_healthy(site, container_port)
+        self._nextjs_write_nginx(site, name, container_port, deployment_mode, backend_url)
+        self._nextjs_push_proxy(site, container_port, app_server_private_ip,
+                                proxy_hosts or [], press_callback_url, press_callback_token)
+        return {"status": "Running", "container": name, "port": container_port,
+                "deployment_mode": deployment_mode}
 
-        return {"status": "Running", "container": name, "port": port}
+    # ── Teardown ───────────────────────────────────────────────────────
 
-    def _clone(self, site: str, p: dict) -> str:
+    @job("Teardown Next.js Site")
+    def teardown_nextjs_site(
+        self, site, container_name=None,
+        proxy_hosts=None, press_callback_url="", press_callback_token="",
+    ):
+        c    = _client()
+        base = container_name or _cname(site)
+        for name in [base, f"{base}_blue", f"{base}_green"]:
+            _remove_container(c, name)
+        self._nextjs_remove_nginx(site)
+        if proxy_hosts:
+            self._nextjs_remove_proxy(site, proxy_hosts, press_callback_url, press_callback_token)
+        return {"status": "Stopped"}
+
+    # ── Redeploy (blue/green) ──────────────────────────────────────────
+
+    @job("Redeploy Next.js Site")
+    def redeploy_nextjs_site(
+        self, site, repo_url, branch, container_port, env_vars,
+        build_args=None, deployment_mode="Full Stack", backend_url="",
+        app_server_private_ip="", proxy_hosts=None,
+        press_callback_url="", press_callback_token="",
+    ):
+        c    = _client()
+        base = _cname(site)
+
+        try:
+            live         = c.containers.get(base)
+            current_slot = live.labels.get("slot", "blue")
+        except docker.errors.NotFound:
+            current_slot = "blue"
+
+        next_slot = "green" if current_slot == "blue" else "blue"
+        next_name = f"{base}_{next_slot}"
+        temp_port = container_port + 1
+
+        repo_dir = self._nextjs_clone(site, repo_url, branch)
+        self._nextjs_inject_templates(repo_dir, site, env_vars)
+        new_tag  = self._nextjs_build(base, repo_dir, build_args or {},
+                                      tag_suffix=next_slot)
+
+        cache_dir = _ensure_cache_dir(site)
+        _remove_container(c, next_name)
+        temp_env = {**env_vars, "PORT": str(temp_port)}
+        c.containers.run(
+            image=new_tag, name=next_name, environment=temp_env,
+            ports={"3000/tcp": temp_port}, network="frappe_net",
+            volumes={cache_dir: {"bind": "/app/.next/cache", "mode": "rw"}},
+            labels={"managed_by": "next_frontend_provisioner", "slot": next_slot},
+            detach=True, restart_policy={"Name": "unless-stopped"},
+        )
+        _wait_healthy(f"http://localhost:{temp_port}/api/health")
+        self._nextjs_write_nginx(site, next_name, temp_port, deployment_mode, backend_url)
+
+        # Drain old container, restart new one on canonical port + name
+        _remove_container(c, base, timeout=15)
+        _remove_container(c, next_name)
+        c.containers.run(
+            image=new_tag, name=base, environment=env_vars,
+            ports={"3000/tcp": container_port}, network="frappe_net",
+            volumes={cache_dir: {"bind": "/app/.next/cache", "mode": "rw"}},
+            labels={"managed_by": "next_frontend_provisioner", "slot": next_slot},
+            detach=True, restart_policy={"Name": "unless-stopped"},
+        )
+        _wait_healthy(f"http://localhost:{container_port}/api/health")
+        self._nextjs_write_nginx(site, base, container_port, deployment_mode, backend_url)
+        self._nextjs_push_proxy(site, container_port, app_server_private_ip,
+                                proxy_hosts or [], press_callback_url, press_callback_token)
+
+        return {"status": "Running", "slot": next_slot, "port": container_port,
+                "deployment_mode": deployment_mode}
+
+    # ── Step helpers ───────────────────────────────────────────────────
+
+    @step("Clone Next.js Repository")
+    def _nextjs_clone(self, site: str, repo_url: str, branch: str) -> str:
         repo_dir = f"/home/frappe/nextjs/{site}"
         if os.path.exists(repo_dir):
-            subprocess.run(["git","-C",repo_dir,"fetch","--all"], check=True, capture_output=True)
-            subprocess.run(["git","-C",repo_dir,"checkout",p.get("branch","main")], check=True, capture_output=True)
-            subprocess.run(["git","-C",repo_dir,"pull"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo_dir, "fetch", "--all"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo_dir, "checkout", branch],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo_dir, "pull"],
+                           check=True, capture_output=True)
         else:
             subprocess.run(
-                ["git","clone","-b",p.get("branch","main"),"--depth","1",p["repo_url"],repo_dir],
+                ["git", "clone", "-b", branch, "--depth", "1", repo_url, repo_dir],
                 check=True, capture_output=True,
             )
         return repo_dir
 
-    def _inject_templates(self, repo_dir: str, site: str, p: dict):
+    @step("Inject Next.js Templates")
+    def _nextjs_inject_templates(self, repo_dir: str, site: str, env_vars: dict):
         try:
             from agent.template_injector import inject_templates
-            inject_templates(repo_dir, site, p)
+            inject_templates(repo_dir, site, {"env_vars": env_vars})
         except ImportError:
-            pass  # template_injector optional
+            pass
 
-    def _build(self, name: str, repo_dir: str, p: dict) -> str:
+    @step("Build Next.js Image")
+    def _nextjs_build(self, name: str, repo_dir: str, build_args: dict,
+                      tag_suffix: str = "latest") -> str:
         os.environ["DOCKER_BUILDKIT"] = "1"
-        tag = f"{name}:latest"
+        tag = f"{name}:{tag_suffix}"
         c = _client()
         _, logs = c.images.build(
             path=repo_dir, tag=tag,
-            buildargs=p.get("build_args", {}),
+            buildargs=build_args,
             rm=True, pull=True,
         )
         for _ in logs:
             pass
         return tag
 
-    def _start(self, name: str, tag: str, port: int, env: dict, cache_dir: str):
+    @step("Start Next.js Container")
+    def _nextjs_start_container(self, name: str, tag: str, port: int,
+                                env: dict, cache_dir: str):
         c = _client()
         _remove_container(c, name)
         c.containers.run(
@@ -141,146 +228,53 @@ class ProvisionNextjsSiteJob:
             detach=True, restart_policy={"Name": "unless-stopped"},
         )
 
-    def _push_proxy(self, site: str, port: int, p: dict):
-        proxy_hosts = p.get("proxy_hosts", [])
-        if not proxy_hosts:
-            return
-        from agent.proxy_manager import run_proxy_playbook
-        run_proxy_playbook(
-            site_name             = site,
-            container_port        = port,
-            app_server_private_ip = p.get("app_server_private_ip", ""),
-            proxy_hosts           = proxy_hosts,
-            press_callback_url    = p.get("press_callback_url", ""),
-            press_callback_token  = p.get("press_callback_token", ""),
-            deployment_mode       = p.get("deployment_mode", "Full Stack"),
-            backend_url           = p.get("backend_url", ""),
+    @step("Wait for Next.js Health")
+    def _nextjs_wait_healthy(self, site: str, port: int):
+        _wait_healthy(f"http://localhost:{port}/api/health")
+
+    @step("Write nginx Config")
+    def _nextjs_write_nginx(self, site: str, container_name: str, port: int,
+                            deployment_mode: str = "Full Stack",
+                            backend_url: str = ""):
+        from agent.nginx_utils import write_upstream
+        write_upstream(
+            site_name=site,
+            container_name=container_name,
+            port=port,
+            deployment_mode=deployment_mode,
+            backend_url=backend_url,
         )
 
-
-# ── Teardown ──────────────────────────────────────────────────────────
-
-class TeardownNextjsSiteJob:
-    job_type = "Teardown Next.js Site"
-
-    def __init__(self, job, server):
-        self.job    = job
-        self.server = server
-        self.params = job.get("params", {})
-
-    def run(self):
-        site   = self.job["site"]
-        p      = self.params
-        c      = _client()
-        base   = p.get("container_name", _cname(site))
-
-        for name in [base, f"{base}_blue", f"{base}_green"]:
-            _remove_container(c, name)
-
+    @step("Remove nginx Config")
+    def _nextjs_remove_nginx(self, site: str):
         from agent.nginx_utils import remove_upstream
         remove_upstream(site)
 
-        proxy_hosts = p.get("proxy_hosts", [])
-        if proxy_hosts:
-            from agent.proxy_manager import remove_proxy_playbook
-            remove_proxy_playbook(
-                site_name            = site,
-                proxy_hosts          = proxy_hosts,
-                press_callback_url   = p.get("press_callback_url", ""),
-                press_callback_token = p.get("press_callback_token", ""),
-            )
-
-        return {"status": "Stopped"}
-
-
-# ── Redeploy (blue/green) ─────────────────────────────────────────────
-
-class RedeployNextjsSiteJob:
-    job_type = "Redeploy Next.js Site"
-
-    def __init__(self, job, server):
-        self.job    = job
-        self.server = server
-        self.params = job.get("params", {})
-
-    def run(self):
-        site   = self.job["site"]
-        p      = self.params
-        port   = p["container_port"]
-        c      = _client()
-        base   = _cname(site)
-
-        # Determine current live slot
-        try:
-            live = c.containers.get(base)
-            current_slot = live.labels.get("slot", "blue")
-        except docker.errors.NotFound:
-            current_slot = "blue"
-
-        next_slot  = "green" if current_slot == "blue" else "blue"
-        next_name  = f"{base}_{next_slot}"
-        temp_port  = port + 1
-
-        # Pull latest code and build new image
-        prov = ProvisionNextjsSiteJob(self.job, self.server)
-        repo_dir = prov._clone(site, p)
-        prov._inject_templates(repo_dir, site, p)
-
-        os.environ["DOCKER_BUILDKIT"] = "1"
-        new_tag = f"{base}:{next_slot}"
-        _, logs = c.images.build(
-            path=repo_dir, tag=new_tag,
-            buildargs=p.get("build_args", {}), rm=True, pull=True,
-        )
-        for _ in logs:
-            pass
-
-        # Start new slot on temp port
-        cache_dir = _ensure_cache_dir(site)
-        _remove_container(c, next_name)
-        env = {**p["env_vars"], "PORT": str(temp_port)}
-        c.containers.run(
-            image=new_tag, name=next_name, environment=env,
-            ports={"3000/tcp": temp_port}, network="frappe_net",
-            volumes={cache_dir: {"bind": "/app/.next/cache", "mode": "rw"}},
-            labels={"managed_by": "next_frontend_provisioner", "slot": next_slot},
-            detach=True, restart_policy={"Name": "unless-stopped"},
-        )
-
-        # Health-check new slot, then cut nginx over
-        _wait_healthy(f"http://localhost:{temp_port}/api/health")
-        _write_nginx(site, next_name, temp_port)
-
-        # Drain old live container
-        _remove_container(c, base, timeout=15)
-
-        # Restart new slot on canonical port with canonical name
-        _remove_container(c, next_name)
-        c.containers.run(
-            image=new_tag, name=base, environment=p["env_vars"],
-            ports={"3000/tcp": port}, network="frappe_net",
-            volumes={cache_dir: {"bind": "/app/.next/cache", "mode": "rw"}},
-            labels={"managed_by": "next_frontend_provisioner", "slot": next_slot},
-            detach=True, restart_policy={"Name": "unless-stopped"},
-        )
-        _wait_healthy(f"http://localhost:{port}/api/health")
-        _write_nginx(site, base, port)
-        self._push_proxy(site, port, p)
-
-        return {"status": "Running", "slot": next_slot, "port": port}
-
-    def _push_proxy(self, site: str, port: int, p: dict):
-        proxy_hosts = p.get("proxy_hosts", [])
+    @step("Push Proxy Config")
+    def _nextjs_push_proxy(self, site: str, port: int, app_server_private_ip: str,
+                           proxy_hosts: list, press_callback_url: str,
+                           press_callback_token: str):
         if not proxy_hosts:
-            return
+            return {}
         from agent.proxy_manager import run_proxy_playbook
         run_proxy_playbook(
             site_name             = site,
             container_port        = port,
-            app_server_private_ip = p.get("app_server_private_ip", ""),
+            app_server_private_ip = app_server_private_ip,
             proxy_hosts           = proxy_hosts,
-            press_callback_url    = p.get("press_callback_url", ""),
-            press_callback_token  = p.get("press_callback_token", ""),
-            deployment_mode       = p.get("deployment_mode", "Full Stack"),
-            backend_url           = p.get("backend_url", ""),
+            press_callback_url    = press_callback_url,
+            press_callback_token  = press_callback_token,
         )
+        return {"proxy_hosts": len(proxy_hosts)}
+
+    @step("Remove Proxy Config")
+    def _nextjs_remove_proxy(self, site: str, proxy_hosts: list,
+                             press_callback_url: str, press_callback_token: str):
+        from agent.proxy_manager import remove_proxy_playbook
+        remove_proxy_playbook(
+            site_name            = site,
+            proxy_hosts          = proxy_hosts,
+            press_callback_url   = press_callback_url,
+            press_callback_token = press_callback_token,
+        )
+        return {"proxy_hosts": len(proxy_hosts)}
