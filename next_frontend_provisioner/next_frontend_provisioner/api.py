@@ -126,3 +126,35 @@ def _assert_exists(site_name: str):
             _("No Nextjs Site record found for {0}").format(site_name),
             frappe.DoesNotExistError,
         )
+
+
+@frappe.whitelist()
+def debug_agent_connection(site_name: str):
+    """
+    Diagnostic endpoint — returns the resolved IP, port, and agent URL
+    for a Nextjs Site without dispatching any job.
+
+    Usage from bench console:
+        frappe.call("next_frontend_provisioner.next_frontend_provisioner.api.debug_agent_connection",
+                    site_name="crm.yourdomain.com")
+
+    Or set via bench config to override port:
+        bench --site your-site set-config nfp_agent_port 2222
+    """
+    from next_frontend_provisioner.next_frontend_provisioner.provisioner import (
+        _get_server, _get_server_ip, _get_agent_port, _is_colocated
+    )
+    _assert_exists(site_name)
+    doc    = frappe.get_doc("Nextjs Site", site_name)
+    server = _get_server(doc)
+    ip     = _get_server_ip(server)
+    port   = _get_agent_port(server)
+    return {
+        "server":      server.name,
+        "private_ip":  server.private_ip,
+        "public_ip":   server.ip,
+        "colocated":   _is_colocated(server),
+        "resolved_ip": ip,
+        "resolved_port": port,
+        "agent_url":   f"http://{ip}:{port}/agent/job",
+    }
