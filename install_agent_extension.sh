@@ -1,77 +1,64 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # install_agent_extension.sh
-# ---------------------------
-# Run on the AGENT SERVER to wire in the Next.js job mixin.
-# Usage:  sudo bash install_agent_extension.sh [AGENT_REPO_PATH]
-# Default: /var/frappe/agent/repo
+# Run as root (or with sudo) on f1.evoq.app to patch the frappe/agent.
+# Tested against: /var/frappe/agent  with Python 3.12 / gunicorn 20.0.4
 
 set -euo pipefail
 
-AGENT_REPO="${1:-/var/frappe/agent/repo}"
-AGENT_PKG="${AGENT_REPO}/agent"
-SERVER_PY="${AGENT_PKG}/server.py"
-JOB_PY="${AGENT_PKG}/job.py"
+AGENT_REPO="/var/frappe/agent/repo"
+AGENT_PKG="$AGENT_REPO/agent"
+NFP_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "==> Agent repo: ${AGENT_REPO}"
+echo "=== [1/4] Copying agent extension files ==="
+cp "$NFP_DIR/agent_extension/frontend_patch.py"    "$AGENT_PKG/frontend.py"
+cp "$NFP_DIR/agent_extension/nginx_utils.py"       "$AGENT_PKG/nginx_utils.py"
+cp "$NFP_DIR/agent_extension/template_injector.py" "$AGENT_PKG/template_injector.py"
+echo "  -> frontend.py, nginx_utils.py, template_injector.py copied"
 
-# 1. Copy nextjs_jobs.py
-echo "==> Copying nextjs_jobs.py"
-cp "$(dirname "$0")/agent_extension/agent_jobs.py" "${AGENT_PKG}/nextjs_jobs.py"
-
-# 2. Copy nginx_utils.py
-echo "==> Copying nginx_utils.py"
-cp "$(dirname "$0")/agent_extension/nginx_utils.py" "${AGENT_PKG}/nginx_utils.py"
-
-# 3. Copy frontend.py
-echo "==> Copying frontend_patch.py → frontend.py"
-cp "$(dirname "$0")/agent_extension/frontend_patch.py" "${AGENT_PKG}/frontend.py"
-
-# 4. REMOVE any nextjs_jobs import from job.py — it causes a circular import.
-#    NextjsMixin is imported ONLY in server.py.
-echo "==> Cleaning job.py (removing any nextjs_jobs imports)"
-python3 << PYEOF
-import re
-path = "${JOB_PY}"
-text = open(path).read()
-cleaned = re.sub(r'\nfrom agent\.nextjs_jobs import[^\n]*\n', '\n', text)
-if cleaned != text:
-    open(path, 'w').write(cleaned)
-    print("  Removed stale nextjs_jobs import from job.py")
-else:
-    print("  job.py already clean")
-PYEOF
-
-# 5. Patch server.py — add NextjsMixin to Server
-if grep -q "NextjsMixin" "${SERVER_PY}"; then
-    echo "==> server.py already has NextjsMixin — skipping"
+echo ""
+echo "=== [2/4] Checking web.py for deploy_frontend route ==="
+if grep -q "deploy_frontend" "$AGENT_PKG/web.py"; then
+    echo "  -> /frontends deploy route already present in web.py — no patch needed"
 else
-    echo "==> Patching server.py"
-    python3 << PYEOF
-import sys, re
-path = "${SERVER_PY}"
-text = open(path).read()
-matches = list(re.finditer(r'^from agent\.\S+.*$', text, re.MULTILINE))
-if not matches:
-    print("ERROR: no 'from agent.' imports in server.py"); sys.exit(1)
-text = text[:matches[-1].end()] + "\nfrom agent.nextjs_jobs import NextjsMixin" + text[matches[-1].end():]
-new_text, n = re.subn(r'\bclass Server\(Base\)\s*:', 'class Server(NextjsMixin, Base):', text)
-if n == 0:
-    print("ERROR: class Server(Base) not found"); sys.exit(1)
-open(path, 'w').write(new_text)
-print("  Patched: Server(Base) → Server(NextjsMixin, Base)")
-PYEOF
+    echo "  WARNING: /frontends route not found in web.py."
+    echo "  You may need to add it manually. See agent_extension/AGENT_INTEGRATION.md"
 fi
 
-# 6. Verify import before restarting
-echo "==> Testing import..."
-cd "${AGENT_REPO}"
-/home/frappe/agent/env/bin/python -c "from agent.server import Server; print('  ✓ Import OK')" || {
-    echo "ERROR: import failed — not restarting. Fix the error above."
-    exit 1
-}
+echo ""
+echo "=== [3/4] Verifying agent config.json ==="
+CFG="/var/frappe/agent/config.json"
+WEB_PORT=$(python3 -c "import json; print(json.load(open('$CFG')).get('web_port','NOT SET'))" 2>/dev/null || echo "UNREADABLE")
+NGINX_DIR=$(python3 -c "import json; print(json.load(open('$CFG')).get('nginx_directory','NOT SET'))" 2>/dev/null || echo "UNREADABLE")
+echo "  web_port      : $WEB_PORT"
+echo "  nginx_dir     : $NGINX_DIR"
 
-# 7. Restart
-echo "==> Restarting agent:web"
-supervisorctl restart agent:web
+echo ""
+echo "=== [4/4] Restarting frappe-agent ==="
+systemctl restart frappe-agent 2>/dev/null || \
+  supervisorctl restart agent:web 2>/dev/null || \
+  (cd /var/frappe/agent && pkill -f gunicorn && sleep 2 && \
+    /var/frappe/agent/env/bin/gunicorn \
+      --workers 2 --bind 127.0.0.1:${WEB_PORT:-25052} \
+      --daemon --log-file /var/frappe/agent/logs/web.error.log \
+      agent.web:application) && echo "  -> agent restarted"
+
+echo ""
+echo "=== Verification ==="
 sleep 2
-supervisorctl status agent:web
+AGENT_PASS=$(cd /var/sdlpress/frappe-bench && \
+  bench --site sdlpress.evoq.app execute \
+  "lambda: frappe.get_doc('Server', 'f1.evoq.app').get_password('agent_password')" \
+  2>/dev/null | tr -d "'" || echo "")
+
+if [ -n "$AGENT_PASS" ]; then
+    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer $AGENT_PASS" \
+      http://127.0.0.1:${WEB_PORT:-25052}/frontends 2>/dev/null)
+    echo "  GET /frontends → HTTP $RESP  (expected 200)"
+else
+    echo "  Could not retrieve agent password for verification."
+    echo "  Run manually: curl -H 'Authorization: Bearer PASSWORD' http://127.0.0.1:25052/frontends"
+fi
+
+echo ""
+echo "Done. The agent now accepts /frontends/<name>/deploy and /frontends/<name> DELETE."

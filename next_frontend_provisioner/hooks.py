@@ -23,5 +23,13 @@ agent_job_types = [
 
 # ── Desk form JS ─────────────────────────────────────────────────────
 doctype_js = {
-    "Nextjs Site": "public/js/nextjs_site.js",
+    "Nextjs Site": "next_frontend_provisioner/public/js/nextjs_site.js",
 }
+
+# Nextjs Site on_trash: teardown containers for Frontend Only records
+# (Press Site on_trash won't fire for Frontend Only since no Press Site exists)
+doc_events.update({
+    "Nextjs Site": {
+        "on_trash": "next_frontend_provisioner.next_frontend_provisioner.press_hooks.on_nextjs_site_delete",
+    }
+})

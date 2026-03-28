@@ -95,11 +95,26 @@ class Frontend(Base):
                      deployment_mode: str = "Full Stack",
                      backend_url: str = ""):
         try:
+            import json as _json, os as _os
+            # Resolve the nginx conf directory from agent config.json
+            conf_dir = "/etc/nginx/conf.d"
+            for cfg_path in ("/var/frappe/agent/config.json", "/home/frappe/agent/config.json"):
+                try:
+                    with open(cfg_path) as _f:
+                        _cfg = _json.load(_f)
+                    nginx_dir = _cfg.get("nginx_directory")
+                    if nginx_dir:
+                        conf_dir = nginx_dir
+                        break
+                except (FileNotFoundError, PermissionError, ValueError):
+                    continue
+
             from agent.nginx_utils import write_upstream
             write_upstream(
                 site_name       = self.name,
                 container_name  = self.name,
                 port            = port,
+                conf_dir        = conf_dir,
                 deployment_mode = deployment_mode,
                 backend_url     = backend_url,
             )

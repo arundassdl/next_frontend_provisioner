@@ -48,3 +48,22 @@ def on_site_delete(doc, method=None):
         timeout=180,
         job_id=f"nextjs_teardown_{doc.name}",
     )
+
+
+def on_nextjs_site_delete(doc, method=None):
+    """
+    Called when a Nextjs Site record is deleted directly.
+    Triggers container teardown for Frontend Only records
+    (which have no Press Site to fire on_site_delete).
+    """
+    if getattr(doc, "deployment_mode", "Full Stack") != "Frontend Only":
+        return
+    if doc.status in ("Stopped", "Failed", "Pending"):
+        return
+    frappe.enqueue(
+        "next_frontend_provisioner.next_frontend_provisioner.provisioner.dispatch_teardown",
+        site_name=doc.name,
+        queue="default",
+        timeout=180,
+        job_id=f"nextjs_teardown_{doc.name}",
+    )

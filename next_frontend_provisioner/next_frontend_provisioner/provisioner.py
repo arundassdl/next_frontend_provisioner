@@ -1,24 +1,44 @@
 """
 provisioner.py
 --------------
-Orchestrates all operations by dispatching Agent Jobs to the Press
-agent running on the application server.  Never calls Docker directly.
+Dispatches Next.js deployment operations to the frappe/agent REST API.
+
+Agent details confirmed from /var/frappe/agent/config.json:
+  Base URL : http://127.0.0.1:25052  (web_port, loopback — same host)
+  Auth     : Authorization: Bearer <plain-text agent_password>
+              (agent hashes it via pbkdf2 and compares against access_token)
+
+Agent endpoints (confirmed from web.py grep):
+  POST   /frontends/<name>/deploy   — clone + build + run container + nginx
+  DELETE /frontends/<name>          — stop container + remove nginx
+
+Agent handler signature (confirmed from frontend.py lines 30-84):
+  deploy_frontend(repo, branch, port, env_vars=None,
+                  deployment_mode="Full Stack", backend_url="")
+
+  The <name> in the URL becomes Frontend.name — used as the Docker
+  container name and nginx upstream name.  Must be a valid identifier:
+  dots replaced with hyphens (agent convention seen in URL pattern).
+
+Deployment modes
+----------------
+Full Stack    — requires a matching Press Site. Server resolved via
+                Site → Bench → Server chain.
+Frontend Only — no Press Site required. Server resolved from
+                doc.target_server, else first active Server.
+                FRAPPE_URL set from doc.backend_url.
 """
+import json as _json
+
 import frappe
 import requests
 from frappe import _
 from frappe.utils import now_datetime
 
 
-# ── Internal helpers ──────────────────────────────────────────────────
+# ── Server resolution ─────────────────────────────────────────────────
 
 def _get_server(doc) -> object:
-    """
-    Resolve the Press Server for a Nextjs Site document.
-
-    Frontend Only: uses doc.target_server if set, else first active Server.
-    Full Stack:    traverses Site → Bench → Server.
-    """
     if doc.deployment_mode == "Frontend Only":
         if doc.target_server:
             return frappe.get_doc("Server", doc.target_server)
@@ -33,96 +53,62 @@ def _get_server(doc) -> object:
 
 
 def _is_colocated(server) -> bool:
-    """
-    Returns True when the Press controller and the application server are
-    the same machine.  This happens in single-server self-hosted setups
-    where private_ip is set to 127.0.0.1.
-    """
-    private_ip = getattr(server, "private_ip", None) or ""
-    return private_ip.strip() in ("127.0.0.1", "localhost", "::1")
+    """True when Press controller and app server are on the same host."""
+    return (getattr(server, "private_ip", None) or "").strip() in (
+        "127.0.0.1", "localhost", "::1"
+    )
 
 
 def _get_server_ip(server) -> str:
-    """
-    Resolve the IP address used to reach the agent on this server.
-
-    Co-located (single-server) setup:
-        private_ip == 127.0.0.1 — Press and the agent are on the same host,
-        so 127.0.0.1 is exactly right.
-
-    Separate-server setup:
-        Use private_ip (internal network) first, then fall back to public ip,
-        then the server name (which is usually a hostname).
-    """
     if _is_colocated(server):
         return "127.0.0.1"
-
     for attr in ("private_ip", "ip"):
         val = (getattr(server, attr, None) or "").strip()
-        if val and val not in ("127.0.0.1", "localhost", "::1", ""):
+        if val and val not in ("127.0.0.1", "localhost", "::1"):
             return val
-
-    # Hostname fallback — server.name is typically the FQDN in Press
-    name = (server.name or "").strip()
-    if name:
-        return name
-
-    frappe.throw(
-        _(
-            "Could not resolve a reachable IP for server {0}. "
-            "Check that the Server record has a valid 'ip' or 'private_ip' field."
-        ).format(server.name)
-    )
+    if server.name:
+        return server.name
+    frappe.throw(_("Cannot resolve IP for server {0}.").format(server.name))
 
 
 def _get_agent_port(server) -> int:
     """
-    Resolve the port the Press agent is listening on.
-
-    Resolution order:
-      1. Explicit agent_port / frappe_agent_port on the Server doc
-      2. nfp_agent_port in site config (bench set-config override)
-      3. Port read from the agent's own config.json (most reliable for
-         co-located setups where the file is readable)
-      4. Press agent default: 2222
+    Port resolution order:
+      1. Explicit agent_port on Server doc
+      2. nfp_agent_port in site_config
+      3. web_port from agent config.json  (most reliable for co-located)
+      4. 25052 default
     """
-    # 1. Explicit field on Server doc
     for attr in ("agent_port", "frappe_agent_port"):
         val = getattr(server, attr, None)
         if val:
             return int(val)
 
-    # 2. bench set-config override
-    port = frappe.conf.get("nfp_agent_port")
-    if port:
-        return int(port)
+    cfg_port = frappe.conf.get("nfp_agent_port")
+    if cfg_port:
+        return int(cfg_port)
 
-    # 3. Read from agent config.json (works on co-located setups)
-    #    Press agent uses 'web_port' for the gunicorn HTTP port.
-    import json as _json
-    for candidate in (
+    for path in (
         "/var/frappe/agent/config.json",
         "/home/frappe/agent/config.json",
-        "/var/frappe/agent/repo/config.json",
     ):
         try:
-            with open(candidate) as f:
+            with open(path) as f:
                 cfg = _json.load(f)
-            # 'web_port' is the gunicorn port; fall back to 'port'/'agent_port'
             p = cfg.get("web_port") or cfg.get("port") or cfg.get("agent_port")
             if p:
                 return int(p)
-        except (FileNotFoundError, PermissionError, KeyError, ValueError):
+        except (FileNotFoundError, PermissionError, ValueError):
             continue
 
-    # 4. Press agent default
     return 25052
 
 
 def _get_agent_token(server) -> str:
     """
-    The agent authenticates via Bearer token — the plain-text agent_password
-    stored on the Server doc (which the agent hashes into config.json as access_token).
+    Plain-text agent_password from the Server doc.
+    The agent receives this and compares it against the pbkdf2 hash
+    stored in config.json access_token.
     """
     try:
         return server.get_password("agent_password")
@@ -130,8 +116,8 @@ def _get_agent_token(server) -> str:
         return frappe.conf.get("nfp_agent_password", "")
 
 
-def _get_agent_conn_from_server(server) -> tuple:
-    """Return (base_url, headers) for the Press agent on this server."""
+def _agent_conn(server) -> tuple:
+    """Return (base_url, headers) for all agent requests."""
     ip    = _get_server_ip(server)
     port  = _get_agent_port(server)
     base  = f"http://{ip}:{port}"
@@ -143,17 +129,19 @@ def _get_agent_conn_from_server(server) -> tuple:
     return base, headers
 
 
-def _dispatch_delete(url: str, headers: dict):
-    """DELETE request for teardown operations."""
-    try:
-        resp = requests.delete(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.ConnectionError as exc:
-        frappe.throw(_("Cannot reach the Press agent at {0}: {1}").format(url, str(exc)))
-    except requests.exceptions.HTTPError as exc:
-        frappe.throw(_("Agent teardown error: {0}").format(str(exc)))
+# ── Name slug ─────────────────────────────────────────────────────────
 
+def _slug(site_name: str) -> str:
+    """
+    Convert site_name to the slug used in the agent URL and as the
+    Docker container name.  The agent uses the name directly as the
+    container name — it must be a valid Docker identifier.
+    Dots → hyphens (consistent with URL path component convention).
+    """
+    return site_name.replace(".", "-")
+
+
+# ── Logging ───────────────────────────────────────────────────────────
 
 def _log_event(site_name: str, message: str, level: str = "Info"):
     try:
@@ -171,6 +159,8 @@ def _log_event(site_name: str, message: str, level: str = "Info"):
     frappe.db.commit()
 
 
+# ── Port allocation ───────────────────────────────────────────────────
+
 def _allocate_port() -> int:
     frappe.db.sql("SELECT GET_LOCK('nextjs_port_alloc', 30)")
     try:
@@ -187,14 +177,37 @@ def _allocate_port() -> int:
         frappe.db.sql("SELECT RELEASE_LOCK('nextjs_port_alloc')")
 
 
-def _build_runtime_env(doc) -> dict:
-    env = {r.key: r.value for r in doc.env_variables if r.variable_type == "Runtime"}
+# ── Env builders ──────────────────────────────────────────────────────
+
+def _build_env_vars(doc) -> dict:
+    """
+    Build the env_vars dict sent to the agent's deploy_frontend handler.
+
+    The agent passes these directly to `docker run -e`, so all vars —
+    both runtime and build-time — go into a single flat dict.
+    NEXT_PUBLIC_* vars are included here because docker build --build-arg
+    is handled separately; for simplicity we pass them as env vars too
+    so next.config.js can read them at runtime as well.
+    """
+    env = {}
+
+    # User-defined runtime vars
+    for r in doc.env_variables:
+        env[r.key] = r.value
+
+    # FRAPPE_URL: user-supplied > backend_url > site_name
     if "FRAPPE_URL" not in env:
         if doc.deployment_mode == "Frontend Only" and doc.backend_url:
             env["FRAPPE_URL"] = doc.backend_url.rstrip("/")
         else:
             env["FRAPPE_URL"] = f"https://{doc.site_name}"
+
     env.setdefault("FRAPPE_HOSTNAME", doc.site_name)
+
+    # NEXT_PUBLIC_FRAPPE_URL: same priority
+    if "NEXT_PUBLIC_FRAPPE_URL" not in env:
+        env["NEXT_PUBLIC_FRAPPE_URL"] = env["FRAPPE_URL"]
+
     env.update({
         "PORT":     str(doc.container_port),
         "HOSTNAME": "0.0.0.0",
@@ -203,15 +216,7 @@ def _build_runtime_env(doc) -> dict:
     return env
 
 
-def _build_build_args(doc) -> dict:
-    args = {r.key: r.value for r in doc.env_variables if r.variable_type == "Build"}
-    if "NEXT_PUBLIC_FRAPPE_URL" not in args:
-        if doc.deployment_mode == "Frontend Only" and doc.backend_url:
-            args["NEXT_PUBLIC_FRAPPE_URL"] = doc.backend_url.rstrip("/")
-        else:
-            args["NEXT_PUBLIC_FRAPPE_URL"] = f"https://{doc.site_name}"
-    return args
-
+# ── Proxy hosts (for Ansible) ─────────────────────────────────────────
 
 def _get_proxy_hosts() -> list:
     try:
@@ -226,7 +231,7 @@ def _get_proxy_hosts() -> list:
             if host_ip:
                 hosts.append({
                     "host": host_ip,
-                    "user": p.get("ssh_user") or "frappe",
+                    "user": p.get("ssh_user") or "root",
                     "key":  p.get("ssh_key_path") or "/home/frappe/.ssh/id_rsa",
                 })
         return hosts
@@ -241,45 +246,77 @@ def _get_callback_token() -> str:
 def _callback_url() -> str:
     return (
         f"https://{frappe.local.site}"
-        "/api/method/next_frontend_provisioner.next_frontend_provisioner.api.agent_job_update"
+        "/api/method/next_frontend_provisioner"
+        ".next_frontend_provisioner.api.agent_job_update"
     )
 
 
-def _dispatch(url: str, headers: dict, payload: dict):
-    """
-    POST a job to the agent with a clear error if the connection fails.
-    Raises a user-visible frappe.ValidationError instead of the raw
-    requests exception so the desk shows a readable message.
-    """
+# ── HTTP helpers ──────────────────────────────────────────────────────
+
+def _post(url: str, headers: dict, payload: dict, timeout: int = 30) -> dict:
+    """POST to the agent with clear error messages."""
     try:
-        resp = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     except requests.exceptions.ConnectionError as exc:
         frappe.throw(
             _(
-                "Cannot reach the Press agent at {0}. "
-                "Verify that:\n"
-                "  1. The frappe/agent process is running (supervisorctl status agent:web)\n"
-                "  2. The Server record has the correct IP address\n"
-                "  3. Port {1} is accessible\n\n"
-                "Raw error: {2}"
-            ).format(url, url.split(":")[-1], str(exc))
+                "Cannot reach the Press agent at {0}.\n"
+                "Check: sudo systemctl status frappe-agent  or  "
+                "ps aux | grep gunicorn\n"
+                "Error: {1}"
+            ).format(url, str(exc))
         )
-    except requests.exceptions.HTTPError as exc:
+
+    if not resp.ok:
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text[:400]
         frappe.throw(
-            _("Agent returned an error: {0}. Check /var/frappe/agent/logs/web.error.log").format(str(exc))
+            _(
+                "Agent returned {0} for {1}.\n"
+                "Body: {2}\n"
+                "Check: /var/frappe/agent/logs/web.error.log"
+            ).format(resp.status_code, url, str(body))
         )
+
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _delete(url: str, headers: dict, timeout: int = 15) -> dict:
+    """DELETE to the agent."""
+    try:
+        resp = requests.delete(url, headers=headers, timeout=timeout)
+    except requests.exceptions.ConnectionError as exc:
+        frappe.throw(_("Cannot reach agent at {0}: {1}").format(url, str(exc)))
+
+    if not resp.ok:
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text[:400]
+        frappe.throw(
+            _("Agent DELETE error {0} for {1}: {2}").format(resp.status_code, url, str(body))
+        )
+
+    try:
+        return resp.json()
+    except Exception:
+        return {}
 
 
 # ── Public dispatch functions ─────────────────────────────────────────
 
 def dispatch_provision(site_name: str):
+    """
+    Trigger a deploy via POST /frontends/<slug>/deploy.
+
+    Payload matches frontend.py deploy_frontend signature:
+      repo, branch, port, env_vars, deployment_mode, backend_url
+    """
     doc    = frappe.get_doc("Nextjs Site", site_name)
     server = _get_server(doc)
 
@@ -287,78 +324,74 @@ def dispatch_provision(site_name: str):
         doc.db_set("container_port", _allocate_port())
         doc.reload()
 
-    base_url, headers = _get_agent_conn_from_server(server)
+    base_url, headers = _agent_conn(server)
+    slug = _slug(site_name)
+    url  = f"{base_url}/frontends/{slug}/deploy"
 
-    site_slug = site_name.replace(".", "-")
-    url = f"{base_url}/frontends/{site_slug}/deploy"
+    # Exact payload keys expected by frontend.py deploy_frontend()
     payload = {
-        "repo":     doc.repo_url,
-        "branch":   doc.branch or "main",
-        "port":     doc.container_port,
-        "env_vars": {
-            **_build_runtime_env(doc),
-            **_build_build_args(doc),
-            "DEPLOYMENT_MODE": doc.deployment_mode,
-            "BACKEND_URL":     doc.backend_url or "",
-        },
+        "repo":            doc.repo_url,
+        "branch":          doc.branch or "main",
+        "port":            doc.container_port,
+        "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
-        "backend_url":     doc.backend_url or "",
+        "backend_url":     (doc.backend_url or "").rstrip("/"),
     }
 
-    result = _dispatch(url, headers, payload)
-    if result:
-        agent_job_id = result.get("job", "")
-        doc.db_set("agent_job", agent_job_id)
-        doc.db_set("status", "Pending")
-        mode_tag    = f"[{doc.deployment_mode}]"
-        backend_tag = f" → backend: {doc.backend_url}" if doc.deployment_mode == "Frontend Only" else ""
-        _log_event(site_name, f"{mode_tag} Provision dispatched to {url} — agent job {agent_job_id}{backend_tag}")
-    else:
-        doc.db_set("status", "Failed")
-        _log_event(site_name, f"Provision dispatch returned no result from {url}", "Error")
+    mode_tag    = f"[{doc.deployment_mode}]"
+    backend_tag = f" → {doc.backend_url}" if doc.deployment_mode == "Frontend Only" else ""
+    _log_event(site_name, f"{mode_tag} Dispatching to {url}{backend_tag}")
+
+    result       = _post(url, headers, payload)
+    agent_job_id = result.get("job") or result.get("id") or result.get("name") or ""
+
+    doc.db_set("agent_job", str(agent_job_id))
+    doc.db_set("status", "Pending")
+    _log_event(
+        site_name,
+        f"{mode_tag} Deploy triggered — agent job: {agent_job_id}{backend_tag}",
+    )
 
 
 def dispatch_teardown(site_name: str):
+    """Tear down via DELETE /frontends/<slug>."""
     doc    = frappe.get_doc("Nextjs Site", site_name)
     server = _get_server(doc)
-    base_url, headers = _get_agent_conn_from_server(server)
 
-    site_slug = site_name.replace(".", "-")
-    url = f"{base_url}/frontends/{site_slug}"
+    base_url, headers = _agent_conn(server)
+    slug = _slug(site_name)
+    url  = f"{base_url}/frontends/{slug}"
 
-    result = _dispatch_delete(url, headers)
-    if result is not None:
-        doc.db_set("status", "Stopped")
-        _log_event(site_name, f"Teardown dispatched to {url}")
+    _log_event(site_name, f"Teardown dispatched to {url}")
+    _delete(url, headers)
+
+    doc.db_set("status", "Stopped")
+    _log_event(site_name, "Teardown complete")
 
 
 def dispatch_redeploy(site_name: str):
+    """Redeploy — same as provision, agent handles blue/green internally."""
     doc    = frappe.get_doc("Nextjs Site", site_name)
     server = _get_server(doc)
-    base_url, headers = _get_agent_conn_from_server(server)
 
-    site_slug = site_name.replace(".", "-")
-    url = f"{base_url}/frontends/{site_slug}/deploy"
+    base_url, headers = _agent_conn(server)
+    slug = _slug(site_name)
+    url  = f"{base_url}/frontends/{slug}/deploy"
+
     payload = {
-        "repo":     doc.repo_url,
-        "branch":   doc.branch or "main",
-        "port":     doc.container_port,
-        "env_vars": {
-            **_build_runtime_env(doc),
-            **_build_build_args(doc),
-            "DEPLOYMENT_MODE": doc.deployment_mode,
-            "BACKEND_URL":     doc.backend_url or "",
-        },
+        "repo":            doc.repo_url,
+        "branch":          doc.branch or "main",
+        "port":            doc.container_port,
+        "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
-        "backend_url":     doc.backend_url or "",
+        "backend_url":     (doc.backend_url or "").rstrip("/"),
     }
 
-    result = _dispatch(url, headers, payload)
-    if result:
-        agent_job_id = result.get("job", "")
-        doc.db_set("agent_job", agent_job_id)
-        doc.db_set("status", "Deploying")
-        _log_event(site_name, f"Redeploy dispatched — agent job {agent_job_id}")
-    else:
-        doc.db_set("status", "Failed")
-        _log_event(site_name, "Redeploy dispatch returned no result", "Error")
+    _log_event(site_name, f"[{doc.deployment_mode}] Redeploy dispatched to {url}")
+
+    result       = _post(url, headers, payload)
+    agent_job_id = result.get("job") or result.get("id") or result.get("name") or ""
+
+    doc.db_set("agent_job", str(agent_job_id))
+    doc.db_set("status", "Deploying")
+    _log_event(site_name, f"Redeploy triggered — agent job: {agent_job_id}")
