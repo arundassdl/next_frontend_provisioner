@@ -119,16 +119,40 @@ def _get_agent_port(server) -> int:
     return 25052
 
 
-def _get_agent_conn_from_server(server) -> tuple:
-    """Return (base_url, (user, password)) for the Press agent on this server."""
-    ip   = _get_server_ip(server)
-    port = _get_agent_port(server)
-    base = f"http://{ip}:{port}"
+def _get_agent_token(server) -> str:
+    """
+    The agent authenticates via Bearer token — the plain-text agent_password
+    stored on the Server doc (which the agent hashes into config.json as access_token).
+    """
     try:
-        password = server.get_password("agent_password")
+        return server.get_password("agent_password")
     except Exception:
-        password = frappe.conf.get("nfp_agent_password", "")
-    return base, ("agent", password)
+        return frappe.conf.get("nfp_agent_password", "")
+
+
+def _get_agent_conn_from_server(server) -> tuple:
+    """Return (base_url, headers) for the Press agent on this server."""
+    ip    = _get_server_ip(server)
+    port  = _get_agent_port(server)
+    base  = f"http://{ip}:{port}"
+    token = _get_agent_token(server)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+    return base, headers
+
+
+def _dispatch_delete(url: str, headers: dict):
+    """DELETE request for teardown operations."""
+    try:
+        resp = requests.delete(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.ConnectionError as exc:
+        frappe.throw(_("Cannot reach the Press agent at {0}: {1}").format(url, str(exc)))
+    except requests.exceptions.HTTPError as exc:
+        frappe.throw(_("Agent teardown error: {0}").format(str(exc)))
 
 
 def _log_event(site_name: str, message: str, level: str = "Info"):
@@ -221,7 +245,7 @@ def _callback_url() -> str:
     )
 
 
-def _dispatch(base_url: str, auth: tuple, payload: dict):
+def _dispatch(url: str, headers: dict, payload: dict):
     """
     POST a job to the agent with a clear error if the connection fails.
     Raises a user-visible frappe.ValidationError instead of the raw
@@ -229,9 +253,9 @@ def _dispatch(base_url: str, auth: tuple, payload: dict):
     """
     try:
         resp = requests.post(
-            f"{base_url}/agent/job",
+            url,
             json=payload,
-            auth=auth,
+            headers=headers,
             timeout=15,
         )
         resp.raise_for_status()
@@ -241,17 +265,15 @@ def _dispatch(base_url: str, auth: tuple, payload: dict):
             _(
                 "Cannot reach the Press agent at {0}. "
                 "Verify that:\n"
-                "  1. The frappe/agent process is running on the application server\n"
+                "  1. The frappe/agent process is running (supervisorctl status agent:web)\n"
                 "  2. The Server record has the correct IP address\n"
-                "  3. Port {1} is open between this server and the agent\n\n"
-                "Run on the agent server: honcho start\n"
-                "Check agent logs: journalctl -u frappe-agent -n 50\n\n"
+                "  3. Port {1} is accessible\n\n"
                 "Raw error: {2}"
-            ).format(base_url, base_url.split(":")[-1], str(exc))
+            ).format(url, url.split(":")[-1], str(exc))
         )
     except requests.exceptions.HTTPError as exc:
         frappe.throw(
-            _("Agent returned an error: {0}. Check agent logs on the application server.").format(str(exc))
+            _("Agent returned an error: {0}. Check /var/frappe/agent/logs/web.error.log").format(str(exc))
         )
 
 
@@ -265,87 +287,75 @@ def dispatch_provision(site_name: str):
         doc.db_set("container_port", _allocate_port())
         doc.reload()
 
-    base_url, auth = _get_agent_conn_from_server(server)
+    base_url, headers = _get_agent_conn_from_server(server)
 
+    site_slug = site_name.replace(".", "-")
+    url = f"{base_url}/frontends/{site_slug}/deploy"
     payload = {
-        "job_type": "Provision Next.js Site",
-        "site":     site_name,
-        "params": {
-            "repo_url":              doc.repo_url,
-            "branch":                doc.branch or "main",
-            "container_port":        doc.container_port,
-            "env_vars":              _build_runtime_env(doc),
-            "build_args":            _build_build_args(doc),
-            "deployment_mode":       doc.deployment_mode,
-            "backend_url":           doc.backend_url or "",
-            "app_server_private_ip": _get_server_ip(server),
-            "proxy_hosts":           _get_proxy_hosts(),
-            "press_callback_url":    _callback_url(),
-            "press_callback_token":  _get_callback_token(),
+        "repo":     doc.repo_url,
+        "branch":   doc.branch or "main",
+        "port":     doc.container_port,
+        "env_vars": {
+            **_build_runtime_env(doc),
+            **_build_build_args(doc),
+            "DEPLOYMENT_MODE": doc.deployment_mode,
+            "BACKEND_URL":     doc.backend_url or "",
         },
+        "deployment_mode": doc.deployment_mode,
+        "backend_url":     doc.backend_url or "",
     }
 
-    result = _dispatch(base_url, auth, payload)
+    result = _dispatch(url, headers, payload)
     if result:
-        agent_job_id = result.get("name", "")
+        agent_job_id = result.get("job", "")
         doc.db_set("agent_job", agent_job_id)
         doc.db_set("status", "Pending")
-        mode_tag   = f"[{doc.deployment_mode}]"
+        mode_tag    = f"[{doc.deployment_mode}]"
         backend_tag = f" → backend: {doc.backend_url}" if doc.deployment_mode == "Frontend Only" else ""
-        _log_event(site_name, f"{mode_tag} Provision dispatched to {base_url} — agent job {agent_job_id}{backend_tag}")
+        _log_event(site_name, f"{mode_tag} Provision dispatched to {url} — agent job {agent_job_id}{backend_tag}")
     else:
         doc.db_set("status", "Failed")
-        _log_event(site_name, f"Provision dispatch returned no result from {base_url}", "Error")
+        _log_event(site_name, f"Provision dispatch returned no result from {url}", "Error")
 
 
 def dispatch_teardown(site_name: str):
     doc    = frappe.get_doc("Nextjs Site", site_name)
     server = _get_server(doc)
-    base_url, auth = _get_agent_conn_from_server(server)
+    base_url, headers = _get_agent_conn_from_server(server)
 
-    payload = {
-        "job_type": "Teardown Next.js Site",
-        "site":     site_name,
-        "params": {
-            "container_name":       f"nextjs_{site_name.replace('.', '_')}",
-            "proxy_hosts":          _get_proxy_hosts(),
-            "press_callback_url":   _callback_url(),
-            "press_callback_token": _get_callback_token(),
-        },
-    }
+    site_slug = site_name.replace(".", "-")
+    url = f"{base_url}/frontends/{site_slug}"
 
-    result = _dispatch(base_url, auth, payload)
-    if result:
+    result = _dispatch_delete(url, headers)
+    if result is not None:
         doc.db_set("status", "Stopped")
-        _log_event(site_name, "Teardown job dispatched")
+        _log_event(site_name, f"Teardown dispatched to {url}")
 
 
 def dispatch_redeploy(site_name: str):
     doc    = frappe.get_doc("Nextjs Site", site_name)
     server = _get_server(doc)
-    base_url, auth = _get_agent_conn_from_server(server)
+    base_url, headers = _get_agent_conn_from_server(server)
 
+    site_slug = site_name.replace(".", "-")
+    url = f"{base_url}/frontends/{site_slug}/deploy"
     payload = {
-        "job_type": "Redeploy Next.js Site",
-        "site":     site_name,
-        "params": {
-            "repo_url":              doc.repo_url,
-            "branch":                doc.branch or "main",
-            "container_port":        doc.container_port,
-            "env_vars":              _build_runtime_env(doc),
-            "build_args":            _build_build_args(doc),
-            "deployment_mode":       doc.deployment_mode,
-            "backend_url":           doc.backend_url or "",
-            "app_server_private_ip": _get_server_ip(server),
-            "proxy_hosts":           _get_proxy_hosts(),
-            "press_callback_url":    _callback_url(),
-            "press_callback_token":  _get_callback_token(),
+        "repo":     doc.repo_url,
+        "branch":   doc.branch or "main",
+        "port":     doc.container_port,
+        "env_vars": {
+            **_build_runtime_env(doc),
+            **_build_build_args(doc),
+            "DEPLOYMENT_MODE": doc.deployment_mode,
+            "BACKEND_URL":     doc.backend_url or "",
         },
+        "deployment_mode": doc.deployment_mode,
+        "backend_url":     doc.backend_url or "",
     }
 
-    result = _dispatch(base_url, auth, payload)
+    result = _dispatch(url, headers, payload)
     if result:
-        agent_job_id = result.get("name", "")
+        agent_job_id = result.get("job", "")
         doc.db_set("agent_job", agent_job_id)
         doc.db_set("status", "Deploying")
         _log_event(site_name, f"Redeploy dispatched — agent job {agent_job_id}")

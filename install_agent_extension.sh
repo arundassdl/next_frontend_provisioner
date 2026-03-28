@@ -25,7 +25,11 @@ cp "$(dirname "$0")/agent_extension/agent_jobs.py" "${AGENT_PKG}/nextjs_jobs.py"
 echo "==> Copying nginx_utils.py → ${AGENT_PKG}/nginx_utils.py"
 cp "$(dirname "$0")/agent_extension/nginx_utils.py" "${AGENT_PKG}/nginx_utils.py"
 
-# ── 3. Patch agent/job.py — remove stale import if it was injected ────
+# ── 3. Replace agent/frontend.py with extended version ───────────────
+echo "==> Copying frontend_patch.py → ${AGENT_PKG}/frontend.py"
+cp "$(dirname "$0")/agent_extension/frontend_patch.py" "${AGENT_PKG}/frontend.py"
+
+# ── 4. Patch agent/job.py — remove stale import if it was injected ────
 #    The new pattern doesn't need job.py patched (mixin lives in server.py)
 #    but we keep the import there so the module stays importable cleanly.
 if grep -q "from agent.nextjs_jobs import" "${JOB_PY}"; then
@@ -46,7 +50,7 @@ print("Injected import after:", matches[-1].group())
 PYEOF
 fi
 
-# ── 4. Patch agent/server.py — add NextjsMixin to Server base classes ─
+# ── 5. Patch agent/server.py — add NextjsMixin to Server base classes ─
 if grep -q "NextjsMixin" "${SERVER_PY}"; then
     echo "==> server.py already has NextjsMixin — skipping"
 else
@@ -81,7 +85,7 @@ print(f"Patched server.py: Server(Base) → Server(NextjsMixin, Base)")
 PYEOF
 fi
 
-# ── 5. Restart agent:web ──────────────────────────────────────────────
+# ── 6. Restart agent:web ──────────────────────────────────────────────
 echo "==> Restarting agent:web"
 supervisorctl restart agent:web
 
