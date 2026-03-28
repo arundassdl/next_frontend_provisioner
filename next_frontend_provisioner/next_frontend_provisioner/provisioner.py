@@ -98,24 +98,25 @@ def _get_agent_port(server) -> int:
         return int(port)
 
     # 3. Read from agent config.json (works on co-located setups)
-    import json as _json, os as _os
+    #    Press agent uses 'web_port' for the gunicorn HTTP port.
+    import json as _json
     for candidate in (
-        "/var/frappe/agent/repo/config.json",
-	"/var/frappe/agent/config.json",
+        "/var/frappe/agent/config.json",
         "/home/frappe/agent/config.json",
-        "/home/frappe/frappe-bench/apps/agent/config.json",
+        "/var/frappe/agent/repo/config.json",
     ):
         try:
             with open(candidate) as f:
                 cfg = _json.load(f)
-            p = cfg.get("port") or cfg.get("agent_port")
+            # 'web_port' is the gunicorn port; fall back to 'port'/'agent_port'
+            p = cfg.get("web_port") or cfg.get("port") or cfg.get("agent_port")
             if p:
                 return int(p)
-        except (FileNotFoundError, KeyError, ValueError):
+        except (FileNotFoundError, PermissionError, KeyError, ValueError):
             continue
 
     # 4. Press agent default
-    return 2222
+    return 25052
 
 
 def _get_agent_conn_from_server(server) -> tuple:
