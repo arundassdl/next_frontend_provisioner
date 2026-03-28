@@ -1,20 +1,13 @@
 """
 frontend_patch.py
 -----------------
-Monkey-patches the existing agent/frontend.py Frontend class to add
-deployment_mode and backend_url support WITHOUT replacing the class.
+Monkey-patches agent/frontend.py's Frontend class to support
+deployment_mode and backend_url WITHOUT replacing the class or
+its job_record initialization pipeline.
 
-This preserves the agent's job_record initialization pipeline — which
-is what caused 'Frontend has no attribute job_record' when we replaced
-the class entirely.
+Applied automatically on import. Add one line to web.py imports:
 
-Apply by adding one import to /var/frappe/agent/repo/agent/web.py,
-BEFORE the Frontend class is first used:
-
-    # At the top of web.py, after existing imports:
-    import agent.frontend_patch  # noqa: F401 — applies monkey-patch
-
-Or call apply_patch() from an __init__ or startup hook.
+    import agent.frontend_patch  # noqa: F401
 """
 from __future__ import annotations
 import os
@@ -22,7 +15,6 @@ import json as _json
 
 
 def _read_nginx_dir() -> str:
-    """Read nginx_directory from agent config.json."""
     for path in ("/var/frappe/agent/config.json", "/home/frappe/agent/config.json"):
         try:
             with open(path) as f:
@@ -32,20 +24,45 @@ def _read_nginx_dir() -> str:
     return "/etc/nginx/conf.d"
 
 
+def _write_nginx(site_name: str, port: int,
+                 deployment_mode: str = "Full Stack",
+                 backend_url: str = ""):
+    conf_dir = _read_nginx_dir()
+    try:
+        from agent.nginx_utils import write_upstream
+        write_upstream(
+            site_name=site_name,
+            container_name=site_name,
+            port=port,
+            conf_dir=conf_dir,
+            deployment_mode=deployment_mode,
+            backend_url=backend_url,
+        )
+    except Exception as exc:
+        print(f"[NFP] nginx config warning for {site_name}: {exc}")
+
+
+def _patched_deploy_frontend_job(self, repo, branch, port, env_vars=None,
+                                  deployment_mode="Full Stack", backend_url=""):
+    """
+    Replacement for Frontend.deploy_frontend_job.
+    Accepts the extra deployment_mode and backend_url params and passes
+    them through to deploy_frontend.
+    """
+    self.deploy_frontend(repo, branch, port, env_vars, deployment_mode, backend_url)
+    return {"status": "Success"}
+
+
 def _patched_deploy_frontend(self, repo, branch, port, env_vars=None,
                               deployment_mode="Full Stack", backend_url=""):
     """
-    Replacement for Frontend.deploy_frontend that adds:
-      - deployment_mode awareness
-      - mode-specific nginx config (Frontend Only proxies /api to backend_url)
-
-    The @step decorator on the original is preserved because we copy it
-    from the original method below.
+    Replacement for Frontend.deploy_frontend.
+    Adds mode-aware nginx config after container start.
     """
     work_dir  = os.path.join("/tmp", self.name)
     image_tag = f"frontend-{self.name.lower()}:latest"
 
-    # 1. Clone or pull latest code
+    # 1. Clone or pull
     if os.path.exists(work_dir):
         self.execute(f"git -C {work_dir} fetch origin {branch}")
         self.execute(f"git -C {work_dir} checkout {branch}")
@@ -53,10 +70,10 @@ def _patched_deploy_frontend(self, repo, branch, port, env_vars=None,
     else:
         self.execute(f"git clone --branch {branch} {repo} {work_dir}")
 
-    # 2. Build Docker image
+    # 2. Build
     self.execute(f"docker build -t {image_tag} {work_dir}")
 
-    # 3. Stop and remove existing container (ignore errors if not running)
+    # 3. Stop old container
     self.execute(f"docker stop {self.name}", non_zero_throw=False)
     self.execute(f"docker rm   {self.name}", non_zero_throw=False)
 
@@ -75,52 +92,49 @@ def _patched_deploy_frontend(self, repo, branch, port, env_vars=None,
         f"{image_tag}"
     )
 
-    # 5. Write mode-aware nginx config
-    _write_nginx(
-        site_name       = self.name,
-        port            = port,
-        deployment_mode = deployment_mode,
-        backend_url     = backend_url,
-    )
+    # 5. Write nginx config
+    _write_nginx(self.name, port, deployment_mode, backend_url)
 
 
-def _write_nginx(site_name: str, port: int,
-                 deployment_mode: str = "Full Stack",
-                 backend_url: str = ""):
-    """Write nginx upstream config for the frontend."""
-    conf_dir = _read_nginx_dir()
+def _patched_remove_frontend(self):
+    """Replacement for Frontend.remove_frontend — also removes nginx config."""
     try:
-        from agent.nginx_utils import write_upstream
-        write_upstream(
-            site_name       = site_name,
-            container_name  = site_name,
-            port            = port,
-            conf_dir        = conf_dir,
-            deployment_mode = deployment_mode,
-            backend_url     = backend_url,
-        )
+        self.execute(f"docker stop {self.name}", non_zero_throw=False)
+        self.execute(f"docker rm   {self.name}", non_zero_throw=False)
+    except Exception:
+        pass
+    # Remove nginx config
+    conf_dir = _read_nginx_dir()
+    conf_file = os.path.join(conf_dir, f"{self.name}.nextjs.conf")
+    try:
+        if os.path.exists(conf_file):
+            os.remove(conf_file)
+            try:
+                import subprocess
+                subprocess.run(["nginx", "-s", "reload"], check=True, capture_output=True)
+            except Exception:
+                pass
     except Exception as exc:
-        # Non-fatal — container is running; nginx can be fixed separately
-        print(f"[NFP] nginx config warning for {site_name}: {exc}")
+        print(f"[NFP] nginx removal warning for {self.name}: {exc}")
 
 
 def apply_patch():
-    """
-    Patch Frontend.deploy_frontend in-place.
-    The @step decorator and job_record pipeline are untouched.
-    Only the body of deploy_frontend is replaced.
-    """
     try:
         from agent.frontend import Frontend
-        from agent.job import step
+        from agent.job import job, step
 
-        # Preserve the @step decorator by re-decorating our replacement
-        decorated = step("Deploy Frontend")(_patched_deploy_frontend)
-        Frontend.deploy_frontend = decorated
-        print("[NFP] frontend_patch applied — deploy_frontend patched with mode-aware logic")
+        # Patch deploy_frontend_job (@job decorator) — adds deployment_mode + backend_url params
+        Frontend.deploy_frontend_job = job("Deploy Frontend")(_patched_deploy_frontend_job)
+
+        # Patch deploy_frontend (@step decorator) — adds nginx config
+        Frontend.deploy_frontend = step("Deploy Frontend")(_patched_deploy_frontend)
+
+        # Patch remove_frontend (@step decorator) — adds nginx cleanup
+        Frontend.remove_frontend = step("Remove Frontend Container")(_patched_remove_frontend)
+
+        print("[NFP] frontend_patch applied successfully")
     except ImportError as exc:
-        print(f"[NFP] frontend_patch skipped (import error): {exc}")
+        print(f"[NFP] frontend_patch skipped: {exc}")
 
 
-# Apply automatically on import
 apply_patch()
