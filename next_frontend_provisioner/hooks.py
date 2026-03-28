@@ -23,7 +23,7 @@ agent_job_types = [
 
 # ── Desk form JS ─────────────────────────────────────────────────────
 doctype_js = {
-    "Nextjs Site": "next_frontend_provisioner/public/js/nextjs_site.js",
+    "Nextjs Site": "/public/js/nextjs_site.js",
 }
 
 # Nextjs Site on_trash: teardown containers for Frontend Only records
