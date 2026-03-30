@@ -136,6 +136,36 @@ def _job_model_finish(model, success: bool, tb: str = ""):
     except Exception as exc:
         print(f"[NFP] JobModel update warning: {exc}")
 
+def _press_callback(job_id: str, site_name: str, status: str, message: str = ""):
+    """POST job result back to Press controller to update Nextjs Site status."""
+    import json as _j, urllib.request, urllib.error
+    try:
+        cfg_path = "/var/sdlpress/frappe-bench/sites/cloud.evoq.app/site_config.json"
+        with open(cfg_path) as f:
+            site_cfg = _j.load(f)
+        token = site_cfg.get("nfp_agent_callback_token", "")
+        if not token:
+            print("[NFP] no nfp_agent_callback_token configured — skipping callback")
+            return
+        press_url = _agent_config().get("press_url", "https://cloud.evoq.app")
+        url = press_url + "/api/method/next_frontend_provisioner.next_frontend_provisioner.api.agent_job_update"
+        body = _j.dumps({
+            "job_name": "Provision Next.js Site",
+            "site":     site_name,
+            "status":   status,
+            "output":   message,
+        }).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={
+                "Content-Type":  "application/json",
+                "Authorization": "token " + token,
+            },
+        )
+        urllib.request.urlopen(req, timeout=15)
+        print(f"[NFP] Press callback sent: {status} for {site_name}")
+    except Exception as exc:
+        print(f"[NFP] Press callback failed (non-fatal): {exc}")
 
 # ── RQ worker: deploy ─────────────────────────────────────────────────
 
@@ -221,12 +251,14 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
         _write_nginx(name, port, deployment_mode, backend_url)
 
         _job_model_finish(model, success=True)
+        _press_callback(job_id, name, "Success", "Container running on port " + str(port))
         print(f"[NFP] Deploy '{name}' completed successfully")
 
     except Exception:
         tb = traceback.format_exc()
         print(f"[NFP] Deploy '{name}' FAILED:\n{tb}")
         _job_model_finish(model, success=False, tb=tb)
+        _press_callback(job_id, name, "Failure", tb[:300])
         raise
 
 
@@ -244,6 +276,7 @@ def _nfp_remove(name: str, job_id: str):
     except Exception:
         tb = traceback.format_exc()
         _job_model_finish(model, success=False, tb=tb)
+        _press_callback(job_id, name, "Failure", tb[:300])
         raise
 
 
