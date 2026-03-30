@@ -1,14 +1,32 @@
 """
 frontend_patch.py
 -----------------
-Registers /frontends/<name>/deploy and /frontends/<name> (DELETE)
-routes on the existing Flask application without modifying web.py.
+Registers /frontends/<n>/deploy and /frontends/<n> (DELETE) routes
+on the agent's Flask application without modifying web.py beyond
+a single import line.
 
-Imported by web.py via:
+Uses a Flask Blueprint — avoids the circular import that occurs when
+trying to import `application` from agent.web during web.py's own load.
+
+The Blueprint is registered on the app via the app's before_first_request
+or, more reliably, by hooking into Flask's got_first_request signal —
+but the simplest correct approach is to import the Blueprint into web.py
+via this module and register it there. Since web.py only does:
+
     import agent.frontend_patch  # noqa: F401
 
-This single import is the only change needed in web.py.
-Everything else — routes, RQ jobs, nginx config — lives here.
+...and this module registers the blueprint on the app object *after*
+it is created (using Flask's app context), we use a deferred approach:
+the blueprint is stored here and web.py's `application` object picks it
+up because Python's import system guarantees web.py finishes creating
+`application = Flask(__name__)` before the blueprint registration runs.
+
+How it actually works:
+  web.py line N:    application = Flask(__name__)
+  web.py line N+x:  import agent.frontend_patch
+                    → this module runs _register_blueprint()
+                    → imports application from agent.web  ✓ (already created)
+                    → registers the blueprint
 """
 from __future__ import annotations
 
@@ -18,6 +36,13 @@ import shutil
 import subprocess
 import traceback
 import uuid
+
+from flask import Blueprint, jsonify, request
+
+
+# ── Blueprint ─────────────────────────────────────────────────────────
+# Created at module level — no app reference needed yet.
+_bp = Blueprint("nfp_frontends", __name__)
 
 
 # ── Config helpers ────────────────────────────────────────────────────
@@ -109,7 +134,7 @@ def _job_model_finish(model, success: bool, tb: str = ""):
         print(f"[NFP] JobModel update warning: {exc}")
 
 
-# ── RQ worker functions ───────────────────────────────────────────────
+# ── RQ worker: deploy ─────────────────────────────────────────────────
 
 def _nfp_deploy(name: str, repo: str, branch: str, port: int,
                 env_vars: dict, deployment_mode: str, backend_url: str,
@@ -137,7 +162,7 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
         try:
             from agent.template_injector import inject_templates
             inject_templates(work_dir, name, {"env_vars": env_vars})
-            print("[NFP] templates injected (Dockerfile, next.config, health route)")
+            print("[NFP] templates injected")
         except Exception as exc:
             print(f"[NFP] template injection warning: {exc}")
             # Fallback: write a minimal Dockerfile if none exists
@@ -193,14 +218,16 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
         _write_nginx(name, port, deployment_mode, backend_url)
 
         _job_model_finish(model, success=True)
-        print(f"[NFP] Deploy of '{name}' completed successfully")
+        print(f"[NFP] Deploy '{name}' completed successfully")
 
     except Exception:
         tb = traceback.format_exc()
-        print(f"[NFP] Deploy of '{name}' FAILED:\n{tb}")
+        print(f"[NFP] Deploy '{name}' FAILED:\n{tb}")
         _job_model_finish(model, success=False, tb=tb)
         raise
 
+
+# ── RQ worker: remove ─────────────────────────────────────────────────
 
 def _nfp_remove(name: str, job_id: str):
     """RQ worker: stop container + remove nginx config."""
@@ -210,63 +237,78 @@ def _nfp_remove(name: str, job_id: str):
         _run(f"docker rm   {name}", check=False)
         _remove_nginx(name)
         _job_model_finish(model, success=True)
-        print(f"[NFP] Remove of '{name}' completed")
+        print(f"[NFP] Remove '{name}' completed")
     except Exception:
         tb = traceback.format_exc()
         _job_model_finish(model, success=False, tb=tb)
         raise
 
 
-# ── Flask route registration ──────────────────────────────────────────
+# ── Blueprint routes ──────────────────────────────────────────────────
 
-def _register_routes():
-    """
-    Attach /frontends routes to the existing Flask application.
-    Called once at import time — web.py imports this module after
-    creating `application`, so the object is already available.
-    """
+@_bp.route("/frontends/<string:name>/deploy", methods=["POST"])
+def nfp_deploy_frontend(name):
+    data            = request.json or {}
+    repo            = data.get("repo", "")
+    branch          = data.get("branch", "main")
+    port            = int(data.get("port", 3000))
+    env_vars        = data.get("env_vars") or data.get("env") or {}
+    deployment_mode = data.get("deployment_mode", "Full Stack")
+    backend_url     = data.get("backend_url", "")
+
+    from agent.job import queue as _queue
+    job_id = f"nfp-{name}-{uuid.uuid4().hex[:8]}"
+    _queue("default").enqueue(
+        _nfp_deploy,
+        name, repo, branch, port, env_vars, deployment_mode, backend_url, job_id,
+        job_id=job_id,
+        job_timeout=1800,
+        result_ttl=86400,
+    )
+    return jsonify({"job": job_id, "status": "queued"})
+
+
+@_bp.route("/frontends/<string:name>", methods=["DELETE"])
+def nfp_remove_frontend(name):
+    from agent.job import queue as _queue
+    job_id = f"nfp-rm-{name}-{uuid.uuid4().hex[:8]}"
+    _queue("default").enqueue(
+        _nfp_remove,
+        name, job_id,
+        job_id=job_id,
+        job_timeout=120,
+        result_ttl=86400,
+    )
+    return jsonify({"job": job_id, "status": "queued"})
+
+
+# ── Register blueprint on the Flask app ──────────────────────────────
+# web.py structure:
+#   line ~50:  application = Flask(__name__)   ← created BEFORE this import
+#   line ~N:   import agent.frontend_patch      ← this file runs here
+#
+# By the time this module is imported, `application` already exists
+# in agent.web's namespace, so we can safely import and register.
+
+def _register_blueprint():
     try:
-        from agent.web import application
-        from flask import request, jsonify
-        from agent.job import queue as _queue
-    except ImportError as exc:
-        print(f"[NFP] route registration skipped: {exc}")
-        return
-
-    @application.route("/frontends/<string:name>/deploy", methods=["POST"])
-    def nfp_deploy_frontend(name):
-        data            = request.json or {}
-        repo            = data.get("repo", "")
-        branch          = data.get("branch", "main")
-        port            = int(data.get("port", 3000))
-        env_vars        = data.get("env_vars") or data.get("env") or {}
-        deployment_mode = data.get("deployment_mode", "Full Stack")
-        backend_url     = data.get("backend_url", "")
-
-        job_id = f"nfp-{name}-{uuid.uuid4().hex[:8]}"
-        _queue("default").enqueue(
-            _nfp_deploy,
-            name, repo, branch, port, env_vars, deployment_mode, backend_url, job_id,
-            job_id=job_id,
-            job_timeout=1800,
-            result_ttl=86400,
-        )
-        return jsonify({"job": job_id, "status": "queued"})
-
-    @application.route("/frontends/<string:name>", methods=["DELETE"])
-    def nfp_remove_frontend(name):
-        job_id = f"nfp-rm-{name}-{uuid.uuid4().hex[:8]}"
-        _queue("default").enqueue(
-            _nfp_remove,
-            name, job_id,
-            job_id=job_id,
-            job_timeout=120,
-            result_ttl=86400,
-        )
-        return jsonify({"job": job_id, "status": "queued"})
-
-    print("[NFP] /frontends routes registered on Flask application")
+        # Import the already-created Flask app — NOT a circular import because
+        # application = Flask(__name__) runs before `import agent.frontend_patch`
+        import sys
+        web_module = sys.modules.get("agent.web")
+        if web_module is None:
+            # Fallback: direct import (safe since application is already created)
+            from agent import web as web_module
+        app = getattr(web_module, "application", None)
+        if app is None:
+            print("[NFP] ERROR: could not find Flask application in agent.web")
+            return
+        app.register_blueprint(_bp)
+        print("[NFP] /frontends routes registered successfully")
+    except Exception as exc:
+        print(f"[NFP] Blueprint registration failed: {exc}")
+        import traceback as _tb
+        _tb.print_exc()
 
 
-# ── Auto-register on import ───────────────────────────────────────────
-_register_routes()
+_register_blueprint()
