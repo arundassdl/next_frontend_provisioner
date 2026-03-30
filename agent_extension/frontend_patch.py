@@ -1,140 +1,272 @@
 """
 frontend_patch.py
 -----------------
-Monkey-patches agent/frontend.py's Frontend class to support
-deployment_mode and backend_url WITHOUT replacing the class or
-its job_record initialization pipeline.
+Registers /frontends/<name>/deploy and /frontends/<name> (DELETE)
+routes on the existing Flask application without modifying web.py.
 
-Applied automatically on import. Add one line to web.py imports:
-
+Imported by web.py via:
     import agent.frontend_patch  # noqa: F401
+
+This single import is the only change needed in web.py.
+Everything else — routes, RQ jobs, nginx config — lives here.
 """
 from __future__ import annotations
-import os
+
 import json as _json
+import os
+import shutil
+import subprocess
+import traceback
+import uuid
 
 
-def _read_nginx_dir() -> str:
+# ── Config helpers ────────────────────────────────────────────────────
+
+def _agent_config() -> dict:
     for path in ("/var/frappe/agent/config.json", "/home/frappe/agent/config.json"):
         try:
             with open(path) as f:
-                return _json.load(f).get("nginx_directory", "/etc/nginx/conf.d")
+                return _json.load(f)
         except (FileNotFoundError, PermissionError, ValueError):
-            continue
-    return "/etc/nginx/conf.d"
+            pass
+    return {}
 
 
-def _write_nginx(site_name: str, port: int,
+def _nginx_dir() -> str:
+    return _agent_config().get("nginx_directory", "/home/frappe/agent/nginx")
+
+
+# ── Docker / shell helpers ────────────────────────────────────────────
+
+def _run(cmd: str, check: bool = True) -> str:
+    """Run a shell command, print output, raise on failure if check=True."""
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print(f"[NFP] {cmd[:120]}")
+    if r.stdout:
+        print(r.stdout[:800])
+    if r.returncode != 0:
+        print("STDERR:", r.stderr[:500])
+        if check:
+            raise RuntimeError(f"Command failed: {cmd}\n{r.stderr[:300]}")
+    return r.stdout.strip()
+
+
+# ── Nginx helpers ─────────────────────────────────────────────────────
+
+def _write_nginx(name: str, port: int,
                  deployment_mode: str = "Full Stack",
                  backend_url: str = ""):
-    conf_dir = _read_nginx_dir()
     try:
         from agent.nginx_utils import write_upstream
         write_upstream(
-            site_name=site_name,
-            container_name=site_name,
+            site_name=name,
+            container_name=name,
             port=port,
-            conf_dir=conf_dir,
+            conf_dir=_nginx_dir(),
             deployment_mode=deployment_mode,
             backend_url=backend_url,
         )
+        print(f"[NFP] nginx config written for {name}")
     except Exception as exc:
-        print(f"[NFP] nginx config warning for {site_name}: {exc}")
+        print(f"[NFP] nginx warning (non-fatal): {exc}")
 
 
-def _patched_deploy_frontend_job(self, repo, branch, port, env_vars=None,
-                                  deployment_mode="Full Stack", backend_url=""):
-    """
-    Replacement for Frontend.deploy_frontend_job.
-    Accepts the extra deployment_mode and backend_url params and passes
-    them through to deploy_frontend.
-    """
-    self.deploy_frontend(repo, branch, port, env_vars, deployment_mode, backend_url)
-    return {"status": "Success"}
-
-
-def _patched_deploy_frontend(self, repo, branch, port, env_vars=None,
-                              deployment_mode="Full Stack", backend_url=""):
-    """
-    Replacement for Frontend.deploy_frontend.
-    Adds mode-aware nginx config after container start.
-    """
-    work_dir  = os.path.join("/tmp", self.name)
-    image_tag = f"frontend-{self.name.lower()}:latest"
-
-    # 1. Clone or pull
-    if os.path.exists(work_dir):
-        self.execute(f"git -C {work_dir} fetch origin {branch}")
-        self.execute(f"git -C {work_dir} checkout {branch}")
-        self.execute(f"git -C {work_dir} pull origin {branch}")
-    else:
-        self.execute(f"git clone --branch {branch} {repo} {work_dir}")
-
-    # 2. Build
-    self.execute(f"docker build -t {image_tag} {work_dir}")
-
-    # 3. Stop old container
-    self.execute(f"docker stop {self.name}", non_zero_throw=False)
-    self.execute(f"docker rm   {self.name}", non_zero_throw=False)
-
-    # 4. Start container
-    env_cmd = ""
-    if env_vars:
-        for key, value in env_vars.items():
-            safe_val = str(value).replace('"', '\\"')
-            env_cmd += f' -e {key}="{safe_val}"'
-
-    self.execute(
-        f"docker run -d --restart always "
-        f"--name {self.name} "
-        f"{env_cmd} "
-        f"-p 127.0.0.1:{port}:3000 "
-        f"{image_tag}"
-    )
-
-    # 5. Write nginx config
-    _write_nginx(self.name, port, deployment_mode, backend_url)
-
-
-def _patched_remove_frontend(self):
-    """Replacement for Frontend.remove_frontend — also removes nginx config."""
+def _remove_nginx(name: str):
     try:
-        self.execute(f"docker stop {self.name}", non_zero_throw=False)
-        self.execute(f"docker rm   {self.name}", non_zero_throw=False)
+        from agent.nginx_utils import remove_upstream
+        remove_upstream(name, conf_dir=_nginx_dir())
+        print(f"[NFP] nginx config removed for {name}")
+    except Exception as exc:
+        print(f"[NFP] nginx remove warning: {exc}")
+
+
+# ── JobModel helpers ──────────────────────────────────────────────────
+
+def _job_model_create(job_id: str, label: str):
+    """Create a JobModel record so Press can poll the job status."""
+    try:
+        from agent.job import JobModel, agent_database
+        agent_database.connect(reuse_if_open=True)
+        return JobModel.create(
+            name=label,
+            status="Running",
+            agent_job_id=job_id,
+        )
+    except Exception as exc:
+        print(f"[NFP] JobModel create warning: {exc}")
+        return None
+
+
+def _job_model_finish(model, success: bool, tb: str = ""):
+    if model is None:
+        return
+    try:
+        model.status = "Success" if success else "Failure"
+        if not success and tb:
+            model.data = _json.dumps({"traceback": tb})
+        model.save()
+    except Exception as exc:
+        print(f"[NFP] JobModel update warning: {exc}")
+
+
+# ── RQ worker functions ───────────────────────────────────────────────
+
+def _nfp_deploy(name: str, repo: str, branch: str, port: int,
+                env_vars: dict, deployment_mode: str, backend_url: str,
+                job_id: str):
+    """
+    RQ worker: clone → inject templates → build → run container → nginx.
+    Runs inside the agent's RQ worker process.
+    """
+    model = _job_model_create(job_id, f"Deploy Frontend {name}")
+    try:
+        work_dir  = f"/tmp/nfp-{name}"
+        image_tag = f"nfp-frontend-{name.lower()}:latest"
+
+        # 1. Clone or update repo
+        if os.path.exists(os.path.join(work_dir, ".git")):
+            _run(f"git -C {work_dir} fetch origin {branch}")
+            _run(f"git -C {work_dir} checkout {branch}")
+            _run(f"git -C {work_dir} reset --hard origin/{branch}")
+        else:
+            if os.path.exists(work_dir):
+                shutil.rmtree(work_dir)
+            _run(f"git clone --depth 1 --branch {branch} {repo} {work_dir}")
+
+        # 2. Inject Dockerfile + next.config + health route
+        try:
+            from agent.template_injector import inject_templates
+            inject_templates(work_dir, name, {"env_vars": env_vars})
+            print("[NFP] templates injected (Dockerfile, next.config, health route)")
+        except Exception as exc:
+            print(f"[NFP] template injection warning: {exc}")
+            # Fallback: write a minimal Dockerfile if none exists
+            dockerfile = os.path.join(work_dir, "Dockerfile")
+            if not os.path.exists(dockerfile):
+                with open(dockerfile, "w") as f:
+                    f.write(
+                        "FROM node:20-alpine AS deps\n"
+                        "WORKDIR /app\n"
+                        "COPY package*.json ./\n"
+                        "RUN npm ci\n\n"
+                        "FROM node:20-alpine AS builder\n"
+                        "WORKDIR /app\n"
+                        "COPY . .\n"
+                        "COPY --from=deps /app/node_modules ./node_modules\n"
+                        "RUN npm run build\n\n"
+                        "FROM node:20-alpine AS runner\n"
+                        "WORKDIR /app\n"
+                        "ENV NODE_ENV=production\n"
+                        "COPY --from=builder /app/.next/standalone ./\n"
+                        "COPY --from=builder /app/.next/static ./.next/static\n"
+                        "COPY --from=builder /app/public ./public\n"
+                        "EXPOSE 3000\n"
+                        'CMD ["node", "server.js"]\n'
+                    )
+                print("[NFP] fallback Dockerfile written")
+
+        # 3. Build Docker image (pass NEXT_PUBLIC_* as build args)
+        build_args = " ".join(
+            f'--build-arg {k}="{str(v).replace(chr(34), chr(92)+chr(34))}"'
+            for k, v in env_vars.items()
+            if k.startswith("NEXT_PUBLIC_")
+        )
+        _run(f"docker build {build_args} -t {image_tag} {work_dir}")
+
+        # 4. Stop old container and start new one
+        _run(f"docker stop {name}", check=False)
+        _run(f"docker rm   {name}", check=False)
+
+        env_flags = " ".join(
+            f'-e {k}="{str(v).replace(chr(34), chr(92)+chr(34))}"'
+            for k, v in env_vars.items()
+        )
+        _run(
+            f"docker run -d --restart always"
+            f" --name {name}"
+            f" {env_flags}"
+            f" -p 127.0.0.1:{port}:3000"
+            f" {image_tag}"
+        )
+
+        # 5. Write nginx config
+        _write_nginx(name, port, deployment_mode, backend_url)
+
+        _job_model_finish(model, success=True)
+        print(f"[NFP] Deploy of '{name}' completed successfully")
+
     except Exception:
-        pass
-    # Remove nginx config
-    conf_dir = _read_nginx_dir()
-    conf_file = os.path.join(conf_dir, f"{self.name}.nextjs.conf")
+        tb = traceback.format_exc()
+        print(f"[NFP] Deploy of '{name}' FAILED:\n{tb}")
+        _job_model_finish(model, success=False, tb=tb)
+        raise
+
+
+def _nfp_remove(name: str, job_id: str):
+    """RQ worker: stop container + remove nginx config."""
+    model = _job_model_create(job_id, f"Remove Frontend {name}")
     try:
-        if os.path.exists(conf_file):
-            os.remove(conf_file)
-            try:
-                import subprocess
-                subprocess.run(["nginx", "-s", "reload"], check=True, capture_output=True)
-            except Exception:
-                pass
-    except Exception as exc:
-        print(f"[NFP] nginx removal warning for {self.name}: {exc}")
+        _run(f"docker stop {name}", check=False)
+        _run(f"docker rm   {name}", check=False)
+        _remove_nginx(name)
+        _job_model_finish(model, success=True)
+        print(f"[NFP] Remove of '{name}' completed")
+    except Exception:
+        tb = traceback.format_exc()
+        _job_model_finish(model, success=False, tb=tb)
+        raise
 
 
-def apply_patch():
+# ── Flask route registration ──────────────────────────────────────────
+
+def _register_routes():
+    """
+    Attach /frontends routes to the existing Flask application.
+    Called once at import time — web.py imports this module after
+    creating `application`, so the object is already available.
+    """
     try:
-        from agent.frontend import Frontend
-        from agent.job import job, step
-
-        # Patch deploy_frontend_job (@job decorator) — adds deployment_mode + backend_url params
-        Frontend.deploy_frontend_job = job("Deploy Frontend")(_patched_deploy_frontend_job)
-
-        # Patch deploy_frontend (@step decorator) — adds nginx config
-        Frontend.deploy_frontend = step("Deploy Frontend")(_patched_deploy_frontend)
-
-        # Patch remove_frontend (@step decorator) — adds nginx cleanup
-        Frontend.remove_frontend = step("Remove Frontend Container")(_patched_remove_frontend)
-
-        print("[NFP] frontend_patch applied successfully")
+        from agent.web import application
+        from flask import request, jsonify
+        from agent.job import queue as _queue
     except ImportError as exc:
-        print(f"[NFP] frontend_patch skipped: {exc}")
+        print(f"[NFP] route registration skipped: {exc}")
+        return
+
+    @application.route("/frontends/<string:name>/deploy", methods=["POST"])
+    def nfp_deploy_frontend(name):
+        data            = request.json or {}
+        repo            = data.get("repo", "")
+        branch          = data.get("branch", "main")
+        port            = int(data.get("port", 3000))
+        env_vars        = data.get("env_vars") or data.get("env") or {}
+        deployment_mode = data.get("deployment_mode", "Full Stack")
+        backend_url     = data.get("backend_url", "")
+
+        job_id = f"nfp-{name}-{uuid.uuid4().hex[:8]}"
+        _queue("default").enqueue(
+            _nfp_deploy,
+            name, repo, branch, port, env_vars, deployment_mode, backend_url, job_id,
+            job_id=job_id,
+            job_timeout=1800,
+            result_ttl=86400,
+        )
+        return jsonify({"job": job_id, "status": "queued"})
+
+    @application.route("/frontends/<string:name>", methods=["DELETE"])
+    def nfp_remove_frontend(name):
+        job_id = f"nfp-rm-{name}-{uuid.uuid4().hex[:8]}"
+        _queue("default").enqueue(
+            _nfp_remove,
+            name, job_id,
+            job_id=job_id,
+            job_timeout=120,
+            result_ttl=86400,
+        )
+        return jsonify({"job": job_id, "status": "queued"})
+
+    print("[NFP] /frontends routes registered on Flask application")
 
 
-apply_patch()
+# ── Auto-register on import ───────────────────────────────────────────
+_register_routes()
