@@ -64,15 +64,18 @@ def _nginx_dir() -> str:
 # ── Docker / shell helpers ────────────────────────────────────────────
 
 def _run(cmd: str, check: bool = True) -> str:
-    """Run a shell command, print output, raise on failure if check=True."""
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Use --progress=plain for docker build to get full layer output
+    actual_cmd = cmd
+    if "docker build" in cmd:
+        actual_cmd = cmd.replace("docker build", "docker build --progress=plain", 1)
+    r = subprocess.run(actual_cmd, shell=True, capture_output=True, text=True)
     print(f"[NFP] {cmd[:120]}")
     if r.stdout:
-        print(r.stdout[:800])
+        print(r.stdout)
     if r.returncode != 0:
-        print("STDERR:", r.stderr[:500])
+        print("STDERR (full):", r.stderr)
         if check:
-            raise RuntimeError(f"Command failed: {cmd}\n{r.stderr[:300]}")
+            raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
     return r.stdout.strip()
 
 
