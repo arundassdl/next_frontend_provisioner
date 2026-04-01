@@ -22,11 +22,11 @@ from pathlib import Path
 _HERE         = Path(__file__).parent
 # Dockerfile lives alongside template_injector.py in the agent package.
 # Fall back to the classic templates/docker subdir if NFP_TEMPLATES_DIR is set.
-TEMPLATES_DIR = Path(os.environ.get("NFP_TEMPLATES_DIR", str(_HERE)))
-#TEMPLATES_DIR = Path(os.environ.get(
-#    "NFP_TEMPLATES_DIR",
-#    _HERE / "templates" / "docker",
-#))
+# TEMPLATES_DIR = Path(os.environ.get("NFP_TEMPLATES_DIR", str(_HERE)))
+TEMPLATES_DIR = Path(os.environ.get(
+   "NFP_TEMPLATES_DIR",
+   _HERE / "templates" / "docker",
+))
 
 _CONFIG_FILES       = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs"]
 _STANDALONE_PATTERN = re.compile(r"""output\s*:\s*['"]standalone['"]""", re.IGNORECASE)
