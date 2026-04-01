@@ -42,6 +42,11 @@ ENV NEXT_PRIVATE_STANDALONE=true
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# ── Copy example config files to their real locations if missing ─────
+# Handles repos that ship *-example.ts files instead of committing
+# environment-specific configs (e.g. app-config-example.ts → app-config.ts)
+RUN find . -name '*-example.ts' -o -name '*-example.js' | while read src; do       dest=$(echo "$src" | sed 's/-example\.\(ts\|js\)$/\.\1/');       if [ ! -f "$dest" ]; then         echo "[NFP] copying $src -> $dest";         cp "$src" "$dest";       fi;     done
+
 RUN npm run build
 
 # ── Stage 3: Runner (minimal production image) ────────────────────────

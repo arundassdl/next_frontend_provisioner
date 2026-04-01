@@ -20,10 +20,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE         = Path(__file__).parent
-TEMPLATES_DIR = Path(os.environ.get(
-    "NFP_TEMPLATES_DIR",
-    _HERE / "templates" / "docker",
-))
+# Dockerfile lives alongside template_injector.py in the agent package.
+# Fall back to the classic templates/docker subdir if NFP_TEMPLATES_DIR is set.
+TEMPLATES_DIR = Path(os.environ.get("NFP_TEMPLATES_DIR", str(_HERE)))
+#TEMPLATES_DIR = Path(os.environ.get(
+#    "NFP_TEMPLATES_DIR",
+#    _HERE / "templates" / "docker",
+#))
 
 _CONFIG_FILES       = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs"]
 _STANDALONE_PATTERN = re.compile(r"""output\s*:\s*['"]standalone['"]""", re.IGNORECASE)
@@ -158,7 +161,7 @@ def _inject_health_route(root: Path):
 
     if uses_app:
         app_root = root / "src" / "app" if (root / "src" / "app").exists() else root / "app"
-        dest = app_root / "api" / "health" / "route.ts"        
+        dest = app_root / "api" / "health" / "route.ts"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(_HEALTH_APP)
 
