@@ -157,6 +157,8 @@ def _inject_health_route(root: Path):
     if uses_app:
         app_root = root / "src" / "app" if (root / "src" / "app").exists() else root / "app"
         dest = app_root / "api" / "health" / "route.ts"
+        # copy app-config file
+        shutil.copy2(app_root /"services" /"config" / "app-config-example.ts", app_root /"services" /"config" / "app-config.ts")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(_HEALTH_APP)
 
