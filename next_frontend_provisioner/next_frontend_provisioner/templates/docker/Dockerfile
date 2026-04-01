@@ -1,61 +1,69 @@
-# Injected by next_frontend_provisioner — managed by NFP
-# 4-stage build: deps → builder → runner → final
+# Managed by next_frontend_provisioner — do not remove this header.
+# 3-stage standalone build: deps → builder → runner
 
 FROM node:20-alpine AS base
+ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
 
 # ── Stage 1: Install dependencies ────────────────────────────────────
 FROM base AS deps
+RUN apk add --no-cache libc6-compat
+
+# Copy all lockfiles so the correct package manager is auto-detected
 COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
+
+# Install with whichever lockfile is present.
+# --ignore-scripts skips postinstall hooks (e.g. build:icons) that
+# reference files not present at install time.
 RUN \
-  if [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
-  elif [ -f package-lock.json ]; then npm ci; \
-  elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm install --frozen-lockfile; \
-  else npm install; \
+  if [ -f yarn.lock ]; then \
+    yarn install --frozen-lockfile --ignore-scripts; \
+  elif [ -f package-lock.json ]; then \
+    npm ci --ignore-scripts; \
+  elif [ -f pnpm-lock.yaml ]; then \
+    corepack enable pnpm && pnpm install --frozen-lockfile --ignore-scripts; \
+  else \
+    npm install --ignore-scripts --prefer-offline --no-audit; \
   fi
 
 # ── Stage 2: Build ────────────────────────────────────────────────────
 FROM base AS builder
+
+# Build-time public vars — baked into the client bundle
 ARG NEXT_PUBLIC_FRAPPE_URL
 ARG NEXT_PUBLIC_FRAPPE_HOSTNAME
+ENV NEXT_PUBLIC_FRAPPE_URL=${NEXT_PUBLIC_FRAPPE_URL}
+ENV NEXT_PUBLIC_FRAPPE_HOSTNAME=${NEXT_PUBLIC_FRAPPE_HOSTNAME}
+
+# Tell Next.js to emit standalone output even if next.config.js
+# does not yet have output:'standalone' set.
+ENV NEXT_PRIVATE_STANDALONE=true
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Ensure standalone output is enabled even if next.config.js doesn't have it
-ENV NEXT_PRIVATE_STANDALONE=true
-
 RUN npm run build
 
-# ── Stage 3: Runner ───────────────────────────────────────────────────
+# ── Stage 3: Runner (minimal production image) ────────────────────────
 FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser  --system --uid 1001 nextjs
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser  --system --uid 1001 nextjs
 
-# Copy standalone output if it exists, otherwise copy full .next
-RUN mkdir -p .next/standalone .next/static public
+# public/ and .next/static/ are served by server.js directly
+COPY --from=builder --chown=nextjs:nodejs /app/public            ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static      ./.next/static
 
-COPY --from=builder /app/public* ./public/
-COPY --from=builder /app/.next/static ./.next/static
-
-# Try standalone first, fall back to full next start
-COPY --from=builder /app/.next/standalone* ./.next/standalone/
-COPY --from=builder /app/.next/server* ./.next/server/
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/.next ./.next
-
-RUN chown -R nextjs:nodejs /app
+# Standalone output contains server.js + minimal node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone  ./
 
 USER nextjs
-
 EXPOSE 3000
 
-# Start: prefer standalone server.js, fall back to `next start`
-CMD ["sh", "-c", "if [ -f .next/standalone/server.js ]; then node .next/standalone/server.js; else npx next start; fi"]
+CMD ["node", "server.js"]
