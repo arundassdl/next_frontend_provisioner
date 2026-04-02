@@ -329,6 +329,8 @@ def dispatch_provision(site_name: str):
     url  = f"{base_url}/frontends/{slug}/deploy"
 
     # Exact payload keys expected by frontend.py deploy_frontend()
+    # doc.site_name = the domain field (e.g. "crm.evoq.app")
+    # site_name param = Frappe doc.name (e.g. "crm") — used for DB lookups only
     payload = {
         "repo":            doc.repo_url,
         "branch":          doc.branch or "main",
@@ -336,9 +338,9 @@ def dispatch_provision(site_name: str):
         "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
         "backend_url":     (doc.backend_url or "").rstrip("/"),
-        # Full domain — agent uses this as nginx server_name.
-        # The URL slug (name) is only the Docker container identifier.
-        "site_name":       site_name,
+        # Pass the full domain so the agent uses it as nginx server_name.
+        # Falls back to site_name (Frappe doc name) if site_name field is blank.
+        "site_name":       doc.site_name or site_name,
     }
 
     mode_tag    = f"[{doc.deployment_mode}]"
@@ -387,8 +389,8 @@ def dispatch_redeploy(site_name: str):
         "port":            doc.container_port,
         "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
-        "backend_url":     (doc.backend_url or "").rstrip("/"),
-        "site_name":       site_name,
+        "backend_url":     (doc.backend_url or "").rstrip("/"),,
+        "site_name":       doc.site_name or site_name,
     }
 
     _log_event(site_name, f"[{doc.deployment_mode}] Redeploy dispatched to {url}")

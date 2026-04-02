@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import re
 import shutil
 import subprocess
 import traceback
@@ -58,41 +59,12 @@ def _agent_config() -> dict:
 
 
 def _nginx_dir() -> str:
-    """
-    Returns the directory where nginx conf files should be written.
-    Press's NginxReloadManager monitors this directory (nginx_directory
-    in agent config.json) and syncs configs to the proxy server.
-    We write into a 'hosts' subdirectory to match Press conventions.
-    """
-    base = _agent_config().get("nginx_directory", "/home/frappe/agent/nginx")
-    # Use hosts/ subdirectory — this is where Press writes per-site configs
-    hosts_dir = os.path.join(base, "hosts")
-    import pathlib
-    pathlib.Path(hosts_dir).mkdir(parents=True, exist_ok=True)
-    return hosts_dir
+    return _agent_config().get("nginx_directory", "/home/frappe/agent/nginx")
 
 
-def _app_server_ip() -> str:
-    """
-    Returns the IP address of THIS app server as reachable from the proxy.
-    Reads from agent config.json. Falls back to 127.0.0.1 (co-located setup).
-    """
-    cfg = _agent_config()
-    # Try explicit config keys first
-    for key in ("private_ip", "app_server_ip", "server_ip"):
-        val = cfg.get(key, "").strip()
-        if val and val not in ("0.0.0.0",):
-            return val
-    # Fall back to hostname resolution
-    import socket
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and not ip.startswith("127."):
-            return ip
-    except Exception:
-        pass
-    return "127.0.0.1"
+def _proxy_conf_path() -> str:
+    """Path to the main proxy.conf that Press's nginx reads."""
+    return os.path.join(_nginx_dir(), "proxy.conf")
 
 
 # ── Docker / shell helpers ────────────────────────────────────────────
@@ -113,31 +85,155 @@ def _run(cmd: str, check: bool = True) -> str:
     return r.stdout.strip()
 
 
-# ── Nginx helpers ─────────────────────────────────────────────────────
+# ── Nginx proxy.conf patching ─────────────────────────────────────────
 
-def _write_nginx(name: str, port: int,
-                 deployment_mode: str = "Full Stack",
-                 backend_url: str = ""):
+def _safe_name(domain: str) -> str:
+    return domain.replace(".", "_").replace("-", "_")
+
+
+def _patch_proxy_conf(domain: str, port: int, deployment_mode: str = "Full Stack",
+                      backend_url: str = "") -> None:
+    """
+    Patch proxy.conf to add our Next.js domain to the upstream map.
+
+    Adds:
+      upstream nextjs_<safe_domain> { server 127.0.0.1:<port>; keepalive 32; }
+      <domain> http://nextjs_<safe_domain>;   ← inside $upstream_server_hash map
+      <domain> http://nextjs_<safe_domain>;   ← inside $socket_upstream_hash map (if present)
+
+    For Frontend Only mode, also patches the location blocks by writing a
+    separate include file. But the primary routing (getting nginx to talk to
+    our container) is handled purely through the map entry.
+
+    This is idempotent: calling it multiple times only updates, never duplicates.
+    """
+    proxy_conf = _proxy_conf_path()
+    if not os.path.exists(proxy_conf):
+        print(f"[NFP] proxy.conf not found at {proxy_conf}, skipping patch")
+        return
+
+    safe = _safe_name(domain)
+    upstream_name = f"nextjs_{safe}"
+    upstream_block = (
+        f"upstream {upstream_name} {{\n"
+        f"\tserver 127.0.0.1:{port};\n"
+        f"\tkeepalive 32;\n"
+        f"}}\n"
+    )
+    map_entry = f"\t{domain} http://{upstream_name};"
+
+    # Read current content
+    content = open(proxy_conf).read()
+
+    # ── 1. Remove any stale entry for this domain (idempotency) ──────
+    # Remove old upstream block if it exists
+    content = re.sub(
+        rf"upstream {re.escape(upstream_name)} \{{[^}}]*\}}\n?",
+        "",
+        content,
+    )
+    # Remove old map entries for this domain
+    content = re.sub(rf"^\t{re.escape(domain)}\s+http://\S+;\n?", "", content, flags=re.MULTILINE)
+
+    # ── 2. Add upstream block before the first existing upstream ─────
+    # Insert before the first "upstream " occurrence
+    first_upstream = re.search(r"^upstream \w+", content, re.MULTILINE)
+    if first_upstream:
+        content = content[:first_upstream.start()] + upstream_block + "\n" + content[first_upstream.start():]
+    else:
+        # No existing upstream — prepend
+        content = upstream_block + "\n" + content
+
+    # ── 3. Add map entry to $upstream_server_hash ────────────────────
+    content = content.replace(
+        "\tdefault http://site_not_found;",
+        f"{map_entry}\n\n\tdefault http://site_not_found;",
+        1,  # only first occurrence (upstream map, not socket map)
+    )
+
+    # ── 4. Add map entry to $socket_upstream_hash (if present) ───────
+    # Find the socket map and add our entry there too (needed for websockets)
+    socket_map_match = re.search(
+        r"(map \$actual_host \$socket_upstream_hash \{[^}]*?)(default http://site_not_found;)",
+        content,
+        re.DOTALL,
+    )
+    if socket_map_match:
+        socket_entry = f"\t{domain} http://{upstream_name};\n"
+        if socket_entry.strip() not in content:
+            insert_pos = socket_map_match.start(2)
+            content = content[:insert_pos] + socket_entry + "    " + content[insert_pos:]
+
+    # Write back
+    with open(proxy_conf, "w") as f:
+        f.write(content)
+    print(f"[NFP] proxy.conf patched: added {domain} → {upstream_name} (port {port})")
+
+
+def _unpatch_proxy_conf(domain: str) -> None:
+    """Remove a domain's upstream and map entries from proxy.conf."""
+    proxy_conf = _proxy_conf_path()
+    if not os.path.exists(proxy_conf):
+        return
+
+    safe = _safe_name(domain)
+    upstream_name = f"nextjs_{safe}"
+
+    content = open(proxy_conf).read()
+    content = re.sub(
+        rf"upstream {re.escape(upstream_name)} \{{[^}}]*\}}\n?",
+        "",
+        content,
+    )
+    content = re.sub(
+        rf"^\t{re.escape(domain)}\s+http://\S+;\n?",
+        "",
+        content,
+        flags=re.MULTILINE,
+    )
+    with open(proxy_conf, "w") as f:
+        f.write(content)
+    print(f"[NFP] proxy.conf: removed {domain} entries")
+
+
+def _reload_nginx() -> None:
+    """Reload nginx via NginxReloadManager, falling back to systemctl."""
     try:
-        from agent.nginx_utils import write_upstream
-        write_upstream(
-            site_name=name,
-            app_server_ip=_app_server_ip(),   # IP as seen FROM the proxy
-            port=port,
-            conf_dir=_nginx_dir(),
-            deployment_mode=deployment_mode,
-            backend_url=backend_url,
-        )
-        print(f"[NFP] nginx config written for {name}")
+        from agent.nginx_reload_manager import NginxReloadManager
+        mgr = NginxReloadManager()
+        mgr.request_reload(request_id=f"nfp-{os.getpid()}")
+        print("[NFP] nginx reload requested via NginxReloadManager")
+        return
+    except Exception as exc:
+        print(f"[NFP] NginxReloadManager unavailable ({exc}), falling back to nginx -s reload")
+    try:
+        subprocess.run(["nginx", "-t"], check=True, capture_output=True)
+        subprocess.run(["nginx", "-s", "reload"], check=True, capture_output=True)
+        print("[NFP] nginx reloaded via nginx -s reload")
+    except Exception as exc:
+        print(f"[NFP] nginx reload failed (non-fatal): {exc}")
+
+
+def _write_nginx(domain: str, port: int,
+                 deployment_mode: str = "Full Stack",
+                 backend_url: str = "") -> None:
+    """Patch proxy.conf and reload nginx."""
+    try:
+        _patch_proxy_conf(domain, port, deployment_mode, backend_url)
+        _reload_nginx()
+        print(f"[NFP] nginx routing configured for {domain}")
     except Exception as exc:
         print(f"[NFP] nginx warning (non-fatal): {exc}")
+        import traceback as _tb
+        _tb.print_exc()
 
 
-def _remove_nginx(name: str):
+def _remove_nginx(domain: str) -> None:
+    """Remove domain from proxy.conf and reload nginx."""
     try:
-        from agent.nginx_utils import remove_upstream
-        remove_upstream(name, conf_dir=_nginx_dir())
-        print(f"[NFP] nginx config removed for {name}")
+        _unpatch_proxy_conf(domain)
+        _reload_nginx()
+        print(f"[NFP] nginx routing removed for {domain}")
     except Exception as exc:
         print(f"[NFP] nginx remove warning: {exc}")
 
@@ -149,11 +245,7 @@ def _job_model_create(job_id: str, label: str):
     try:
         from agent.job import JobModel, agent_database
         agent_database.connect(reuse_if_open=True)
-        return JobModel.create(
-            name=label,
-            status="Running",
-            agent_job_id=job_id,
-        )
+        return JobModel.create(name=label, status="Running", agent_job_id=job_id)
     except Exception as exc:
         print(f"[NFP] JobModel create warning: {exc}")
         return None
@@ -169,6 +261,7 @@ def _job_model_finish(model, success: bool, tb: str = ""):
         model.save()
     except Exception as exc:
         print(f"[NFP] JobModel update warning: {exc}")
+
 
 def _press_callback(job_id: str, site_name: str, status: str, message: str = ""):
     """POST job result back to Press controller to update Nextjs Site status."""
@@ -201,22 +294,22 @@ def _press_callback(job_id: str, site_name: str, status: str, message: str = "")
     except Exception as exc:
         print(f"[NFP] Press callback failed (non-fatal): {exc}")
 
+
 # ── RQ worker: deploy ─────────────────────────────────────────────────
 
 def _nfp_deploy(name: str, repo: str, branch: str, port: int,
                 env_vars: dict, deployment_mode: str, backend_url: str,
                 job_id: str, site_name: str = ""):
     """
-    RQ worker: clone → inject templates → build → run container → nginx.
-    Runs inside the agent's RQ worker process.
+    RQ worker: clone → inject templates → build → run container → patch nginx.
 
     Args:
-        name:      Docker container name / URL slug (e.g. "crm-evoq-app").
-        site_name: Full domain for nginx server_name (e.g. "crm.evoq.app").
+        name:      Docker container name / URL slug (e.g. "crm").
+        site_name: Full domain for nginx routing (e.g. "crm.evoq.app").
                    Falls back to `name` if not provided.
     """
-    # Use full domain for nginx server_name; container name for Docker
-    site_name = site_name or name
+    # Use full domain for nginx; container slug for Docker
+    domain = site_name or name
     model = _job_model_create(job_id, f"Deploy Frontend {name}")
     try:
         work_dir  = f"/tmp/nfp-{name}"
@@ -264,7 +357,7 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
                     )
                 print("[NFP] fallback Dockerfile written")
 
-        # 3. Build Docker image (pass NEXT_PUBLIC_* as build args)
+        # 3. Build Docker image
         build_args = " ".join(
             f'--build-arg {k}="{str(v).replace(chr(34), chr(92)+chr(34))}"'
             for k, v in env_vars.items()
@@ -288,36 +381,38 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
             f" {image_tag}"
         )
 
-        # 5. Write nginx config (use full domain as server_name, not container slug)
-        _write_nginx(site_name, port, deployment_mode, backend_url)
+        # 5. Patch proxy.conf to route domain → container
+        # Uses the full domain (e.g. crm.evoq.app) not the slug
+        _write_nginx(domain, port, deployment_mode, backend_url)
 
         _job_model_finish(model, success=True)
-        _press_callback(job_id, site_name, "Success", "Container running on port " + str(port))
-        print(f"[NFP] Deploy '{name}' completed successfully")
+        _press_callback(job_id, domain, "Success", "Container running on port " + str(port))
+        print(f"[NFP] Deploy '{name}' ({domain}) completed successfully")
 
     except Exception:
         tb = traceback.format_exc()
         print(f"[NFP] Deploy '{name}' FAILED:\n{tb}")
         _job_model_finish(model, success=False, tb=tb)
-        _press_callback(job_id, name, "Failure", tb[:300])
+        _press_callback(job_id, domain, "Failure", tb[:300])
         raise
 
 
 # ── RQ worker: remove ─────────────────────────────────────────────────
 
-def _nfp_remove(name: str, job_id: str):
-    """RQ worker: stop container + remove nginx config."""
+def _nfp_remove(name: str, job_id: str, site_name: str = ""):
+    """RQ worker: stop container + remove from nginx."""
+    domain = site_name or name
     model = _job_model_create(job_id, f"Remove Frontend {name}")
     try:
         _run(f"docker stop {name}", check=False)
         _run(f"docker rm   {name}", check=False)
-        _remove_nginx(name)
+        _remove_nginx(domain)
         _job_model_finish(model, success=True)
         print(f"[NFP] Remove '{name}' completed")
     except Exception:
         tb = traceback.format_exc()
         _job_model_finish(model, success=False, tb=tb)
-        _press_callback(job_id, name, "Failure", tb[:300])
+        _press_callback(job_id, domain, "Failure", tb[:300])
         raise
 
 
@@ -332,9 +427,8 @@ def nfp_deploy_frontend(name):
     env_vars        = data.get("env_vars") or data.get("env") or {}
     deployment_mode = data.get("deployment_mode", "Full Stack")
     backend_url     = data.get("backend_url", "")
-    # site_name is the full domain (e.g. "crm.evoq.app").
-    # `name` is the URL slug used as Docker container name (e.g. "crm-evoq-app").
-    # If not provided, fall back to name (backwards compat).
+    # site_name = full domain (e.g. "crm.evoq.app")
+    # name      = container slug (e.g. "crm")
     site_name       = data.get("site_name") or name
 
     from agent.job import queue as _queue
@@ -352,11 +446,15 @@ def nfp_deploy_frontend(name):
 
 @_bp.route("/frontends/<string:name>", methods=["DELETE"])
 def nfp_remove_frontend(name):
+    data      = request.json or {}
+    site_name = data.get("site_name") or name
+
     from agent.job import queue as _queue
     job_id = f"nfp-rm-{name}-{uuid.uuid4().hex[:8]}"
     _queue("default").enqueue(
         _nfp_remove,
         name, job_id,
+        site_name=site_name,
         job_id=job_id,
         job_timeout=120,
         result_ttl=86400,
