@@ -36,8 +36,6 @@ from agent.server import Server
 from agent.snapshot_recovery import SnapshotRecovery
 from agent.ssh import SSHProxy
 from agent.utils import check_installed_pyspy
-from agent.frontend import Frontend
-import agent.frontend_patch  # noqa: F401 — NFP monkey-patch
 
 if TYPE_CHECKING:
     from datetime import datetime, timedelta
@@ -56,6 +54,19 @@ if TYPE_CHECKING:
 
 
 application = Flask(__name__)
+
+import agent.frontend_patch  # noqa: F401 — registers /frontends routes for Next.js provisioner
+
+
+SENSITIVE_CONFIG_KEYS = {
+    "access_token",
+    "redis_port",
+    "redis_password",
+    "db_password",
+    "db_user",
+    "db_host",
+    "db_port",
+}
 
 
 def validate_bench(fn):
@@ -248,6 +259,11 @@ def start_bench_workers():
     return {"job": job}
 
 
+@application.route("/server/running-benches", methods=["GET"])
+def get_running_benches():
+    return {"benches": Server().get_running_bench_containers()}
+
+
 @application.route("/server/force-remove-all-benches", methods=["POST"])
 def force_remove_all_benches():
     job = Server().force_remove_all_benches()
@@ -327,6 +343,25 @@ def update_nginx_ip_access():
         ip_drop=data.get("ip_drop", []),
     )
     return {"job": job}
+
+
+@application.route("/server/get-config", methods=["GET"])
+def get_server_config():
+    config = dict(Server().config or {})
+    return {key: value for key, value in config.items() if key not in SENSITIVE_CONFIG_KEYS}
+
+
+@application.route("/server/update-config", methods=["POST"])
+def update_server_config():
+    config = request.json
+    if not isinstance(config, dict):
+        return jsonify({"error": "Invalid config payload; expected a JSON object."}), 400
+    sanitized_config = {key: value for key, value in config.items() if key not in SENSITIVE_CONFIG_KEYS}
+    stripped_keys = set(config.keys()) - set(sanitized_config.keys())
+    if stripped_keys:
+        log.warning("Stripping sensitive config in updating: %s", (",").join(sorted(stripped_keys)))
+    Server().update_config(sanitized_config)
+    return {"update_config": True}
 
 
 @application.route("/nfs/add-to-acl", methods=["POST"])
@@ -482,6 +517,14 @@ def new_bench():
 @application.route("/benches/<string:bench>/archive", methods=["POST"])
 def archive_bench(bench):
     job = Server().archive_bench(bench)
+    return {"job": job}
+
+
+@application.route("/benches/force-remove", methods=["POST"])
+def force_remove_zombie_benches():
+    data = request.json
+    benches = data.get("benches", [])
+    job = Server().force_remove_zombie_benches(benches)
     return {"job": job}
 
 
@@ -1288,6 +1331,24 @@ def flush_tables():
     return {"job": job}
 
 
+@application.route("/database/refresh-usage", methods=["POST"])
+def refresh_database_usage():
+    data = request.json
+    private_ip = data.get("private_ip")
+    mariadb_root_password = data.get("mariadb_root_password")
+    database = data.get("database")
+    io_ops_limit = data.get("io_ops_limit", 200)
+    concurrency = data.get("concurrency", 20)
+    job = DatabaseServer().refresh_database_usage_job(
+        private_ip=private_ip,
+        mariadb_root_password=mariadb_root_password,
+        database=database,
+        io_ops_limit=io_ops_limit,
+        concurrency=concurrency,
+    )
+    return {"job": job}
+
+
 @application.route("/database/binary/logs")
 def get_binary_logs():
     return jsonify(DatabaseServer().binary_logs)
@@ -1733,167 +1794,6 @@ def setup_code_server(bench):
     job = Server().benches[bench].setup_code_server(**data)
 
     return {"job": job}
-
-
-@application.route("/frontends/<string:name>/deploy", methods=["POST"])
-def deploy_frontend(name):
-    """
-    Deploy a Next.js frontend.
-    Patched by next_frontend_provisioner — uses RQ directly
-    so no job_record initialization is needed.
-    """
-    import uuid
-    data = request.json or {}
-    env_vars        = data.get("env_vars") or data.get("env") or {}
-    deployment_mode = data.get("deployment_mode", "Full Stack")
-    backend_url     = data.get("backend_url", "")
-    repo            = data.get("repo", "")
-    branch          = data.get("branch", "main")
-    port            = data.get("port", 3000)
-
-    from agent.job import queue as _queue
-    job_id = "nfp-" + name + "-" + uuid.uuid4().hex[:8]
-    _queue("default").enqueue(
-        _nfp_run_deploy,
-        name, repo, branch, port, env_vars, deployment_mode, backend_url,
-        job_id=job_id,
-        job_timeout=1800,
-        result_ttl=86400,
-    )
-    return {"job": job_id, "status": "queued"}
-
-
-def _nfp_run_deploy(name, repo, branch, port,
-                    env_vars, deployment_mode, backend_url):
-    """RQ worker — runs Docker deploy steps. No job_record needed."""
-    import json as _j
-    import os
-    import shutil
-    import subprocess
-
-    def _run(cmd, check=True):
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        print("[NFP]", cmd[:120])
-        if r.stdout:
-            print(r.stdout[:500])
-        if r.returncode != 0:
-            print("STDERR:", r.stderr[:500])
-            if check:
-                msg = "Command failed: " + cmd + " — " + r.stderr[:200]
-                raise RuntimeError(msg)
-        return r.stdout.strip()
-
-    # ── 1. Clone / pull ──────────────────────────────────────────────
-    work_dir = "/tmp/nfp-" + name
-    if os.path.exists(os.path.join(work_dir, ".git")):
-        _run("git -C " + work_dir + " fetch origin " + branch)
-        _run("git -C " + work_dir + " checkout " + branch)
-        _run("git -C " + work_dir + " reset --hard origin/" + branch)
-    else:
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir)
-        _run("git clone --depth 1 --branch " + branch + " " + repo + " " + work_dir)
-
-    # ── 2. Build Docker image ────────────────────────────────────────
-    image_tag = "nfp-frontend-" + name.lower() + ":latest"
-    build_args = ""
-    for k, v in env_vars.items():
-        if k.startswith("NEXT_PUBLIC_"):
-            safe = str(v).replace('"', '\"')
-            build_args += " --build-arg " + k + '="' + safe + '"'
-    _run("docker build" + build_args + " -t " + image_tag + " " + work_dir)
-
-    # ── 3. Stop old container ────────────────────────────────────────
-    _run("docker stop " + name, check=False)
-    _run("docker rm   " + name, check=False)
-
-    # ── 4. Start container ───────────────────────────────────────────
-    env_flags = ""
-    for k, v in env_vars.items():
-        safe = str(v).replace('"', '\"')
-        env_flags += " -e " + k + '="' + safe + '"'
-    _run(
-        "docker run -d --restart always"
-        + " --name " + name
-        + env_flags
-        + " -p 127.0.0.1:" + str(port) + ":3000"
-        + " " + image_tag
-    )
-
-    # ── 5. Write nginx config ────────────────────────────────────────
-    try:
-        conf_dir = "/home/frappe/agent/nginx"
-        for cfg_path in ("/var/frappe/agent/config.json",
-                         "/home/frappe/agent/config.json"):
-            try:
-                cfg = _j.load(open(cfg_path))
-                conf_dir = cfg.get("nginx_directory", conf_dir)
-                break
-            except Exception:
-                pass
-        from agent.nginx_utils import write_upstream
-        write_upstream(
-            site_name=name,
-            container_name=name,
-            port=port,
-            conf_dir=conf_dir,
-            deployment_mode=deployment_mode,
-            backend_url=backend_url,
-        )
-        print("[NFP] nginx config written to " + conf_dir)
-    except Exception as exc:
-        print("[NFP] nginx warning (non-fatal): " + str(exc))
-
-
-def _nfp_run_remove(name):
-    import json as _j, subprocess
-    subprocess.run("docker stop " + name, shell=True, capture_output=True)
-    subprocess.run("docker rm   " + name, shell=True, capture_output=True)
-    try:
-        conf_dir = "/home/frappe/agent/nginx"
-        for cfg_path in ("/var/frappe/agent/config.json",
-                         "/home/frappe/agent/config.json"):
-            try:
-                cfg = _j.load(open(cfg_path))
-                conf_dir = cfg.get("nginx_directory", conf_dir)
-                break
-            except Exception:
-                pass
-        from agent.nginx_utils import remove_upstream
-        remove_upstream(name, conf_dir=conf_dir)
-    except Exception as exc:
-        print("[NFP] nginx remove warning: " + str(exc))
-
-
-@application.route("/frontends/<string:name>", methods=["DELETE"])
-def remove_frontend(name):
-    from agent.job import queue as _queue
-    import uuid
-    job_id = f"nfp-rm-{name}-{uuid.uuid4().hex[:8]}"
-    _queue("default").enqueue(
-        _run_frontend_remove, name,
-        job_id=job_id, job_timeout=120,
-    )
-    return {"job": job_id, "status": "queued"}
-
-
-def _run_frontend_remove(name):
-    import subprocess, json as _j
-    subprocess.run(f"docker stop {name}", shell=True)
-    subprocess.run(f"docker rm   {name}", shell=True)
-    try:
-        conf_dir = "/home/frappe/agent/nginx"
-        for cfg_path in ("/var/frappe/agent/config.json", "/home/frappe/agent/config.json"):
-            try:
-                cfg = _j.load(open(cfg_path))
-                conf_dir = cfg.get("nginx_directory", conf_dir)
-                break
-            except Exception:
-                pass
-        from agent.nginx_utils import remove_upstream
-        remove_upstream(name, conf_dir=conf_dir)
-    except Exception as e:
-        print(f"[NFP] nginx remove warning: {e}")
 
 
 @application.route("/benches/<string:bench>/codeserver/start", methods=["POST"])

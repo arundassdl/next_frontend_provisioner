@@ -1,5 +1,6 @@
 # Managed by next_frontend_provisioner — do not edit manually.
 # Site:      {{ site_name }}
+# Mode:      {{ deployment_mode | default('Full Stack') }}
 # Generated: {{ ansible_date_time.iso8601 }}
 
 upstream nextjs_{{ safe_name }} {
@@ -7,6 +8,7 @@ upstream nextjs_{{ safe_name }} {
     keepalive {{ nextjs_keepalive_connections }};
 }
 
+{% if deployment_mode is defined and deployment_mode == 'Frontend Only' %}
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -21,8 +23,21 @@ server {
     add_header X-Content-Type-Options "nosniff"       always;
     add_header Referrer-Policy        "strict-origin" always;
 
-    location /app/ {
-        proxy_pass         http://nextjs_{{ safe_name }}/;
+    # Proxy Frappe API + file calls to the existing backend
+    location ~* ^/(api|files|private/files)/ {
+        proxy_pass         {{ backend_url }};
+        proxy_http_version 1.1;
+        proxy_set_header   Host              {{ backend_host }};
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout    {{ nextjs_proxy_read_timeout }}s;
+        proxy_connect_timeout {{ nextjs_proxy_connect_timeout }}s;
+    }
+
+    # Everything else -> Next.js container
+    location / {
+        proxy_pass         http://nextjs_{{ safe_name }};
         proxy_http_version 1.1;
         proxy_set_header   Upgrade           $http_upgrade;
         proxy_set_header   Connection        "upgrade";
@@ -41,12 +56,19 @@ server {
         add_header Cache-Control "public, max-age=31536000, immutable";
         access_log off;
     }
+}
+{% else %}
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ site_name }};
 
     location /app/_next/image {
         proxy_pass http://nextjs_{{ safe_name }}/_next/image;
         proxy_cache_valid 200 1d;
     }
 }
+{% endif %}
 
 server {
     listen 80;

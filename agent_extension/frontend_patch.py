@@ -58,7 +58,41 @@ def _agent_config() -> dict:
 
 
 def _nginx_dir() -> str:
-    return _agent_config().get("nginx_directory", "/home/frappe/agent/nginx")
+    """
+    Returns the directory where nginx conf files should be written.
+    Press's NginxReloadManager monitors this directory (nginx_directory
+    in agent config.json) and syncs configs to the proxy server.
+    We write into a 'hosts' subdirectory to match Press conventions.
+    """
+    base = _agent_config().get("nginx_directory", "/home/frappe/agent/nginx")
+    # Use hosts/ subdirectory — this is where Press writes per-site configs
+    hosts_dir = os.path.join(base, "hosts")
+    import pathlib
+    pathlib.Path(hosts_dir).mkdir(parents=True, exist_ok=True)
+    return hosts_dir
+
+
+def _app_server_ip() -> str:
+    """
+    Returns the IP address of THIS app server as reachable from the proxy.
+    Reads from agent config.json. Falls back to 127.0.0.1 (co-located setup).
+    """
+    cfg = _agent_config()
+    # Try explicit config keys first
+    for key in ("private_ip", "app_server_ip", "server_ip"):
+        val = cfg.get(key, "").strip()
+        if val and val not in ("0.0.0.0",):
+            return val
+    # Fall back to hostname resolution
+    import socket
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
 
 
 # ── Docker / shell helpers ────────────────────────────────────────────
@@ -88,7 +122,7 @@ def _write_nginx(name: str, port: int,
         from agent.nginx_utils import write_upstream
         write_upstream(
             site_name=name,
-            container_name=name,
+            app_server_ip=_app_server_ip(),   # IP as seen FROM the proxy
             port=port,
             conf_dir=_nginx_dir(),
             deployment_mode=deployment_mode,
