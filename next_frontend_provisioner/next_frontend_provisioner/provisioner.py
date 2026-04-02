@@ -336,6 +336,9 @@ def dispatch_provision(site_name: str):
         "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
         "backend_url":     (doc.backend_url or "").rstrip("/"),
+        # Full domain — agent uses this as nginx server_name.
+        # The URL slug (name) is only the Docker container identifier.
+        "site_name":       site_name,
     }
 
     mode_tag    = f"[{doc.deployment_mode}]"
@@ -385,6 +388,7 @@ def dispatch_redeploy(site_name: str):
         "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
         "backend_url":     (doc.backend_url or "").rstrip("/"),
+        "site_name":       site_name,
     }
 
     _log_event(site_name, f"[{doc.deployment_mode}] Redeploy dispatched to {url}")

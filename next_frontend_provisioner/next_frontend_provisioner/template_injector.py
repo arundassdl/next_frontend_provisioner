@@ -32,7 +32,7 @@ _HEALTH_APP = textwrap.dedent("""\
     // Injected by next_frontend_provisioner — do not remove.
     // Required for container health checks.
     export async function GET() {
-      return Response.json({ status: 'ok', ts: Date.now() })
+      return new Response(JSON.stringify({ status: 'ok', ts: Date.now() }), { headers: { 'Content-Type': 'application/json' } })
     }
 """)
 

@@ -205,11 +205,18 @@ def _press_callback(job_id: str, site_name: str, status: str, message: str = "")
 
 def _nfp_deploy(name: str, repo: str, branch: str, port: int,
                 env_vars: dict, deployment_mode: str, backend_url: str,
-                job_id: str):
+                job_id: str, site_name: str = ""):
     """
     RQ worker: clone → inject templates → build → run container → nginx.
     Runs inside the agent's RQ worker process.
+
+    Args:
+        name:      Docker container name / URL slug (e.g. "crm-evoq-app").
+        site_name: Full domain for nginx server_name (e.g. "crm.evoq.app").
+                   Falls back to `name` if not provided.
     """
+    # Use full domain for nginx server_name; container name for Docker
+    site_name = site_name or name
     model = _job_model_create(job_id, f"Deploy Frontend {name}")
     try:
         work_dir  = f"/tmp/nfp-{name}"
@@ -281,11 +288,11 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
             f" {image_tag}"
         )
 
-        # 5. Write nginx config
-        _write_nginx(name, port, deployment_mode, backend_url)
+        # 5. Write nginx config (use full domain as server_name, not container slug)
+        _write_nginx(site_name, port, deployment_mode, backend_url)
 
         _job_model_finish(model, success=True)
-        _press_callback(job_id, name, "Success", "Container running on port " + str(port))
+        _press_callback(job_id, site_name, "Success", "Container running on port " + str(port))
         print(f"[NFP] Deploy '{name}' completed successfully")
 
     except Exception:
@@ -325,12 +332,17 @@ def nfp_deploy_frontend(name):
     env_vars        = data.get("env_vars") or data.get("env") or {}
     deployment_mode = data.get("deployment_mode", "Full Stack")
     backend_url     = data.get("backend_url", "")
+    # site_name is the full domain (e.g. "crm.evoq.app").
+    # `name` is the URL slug used as Docker container name (e.g. "crm-evoq-app").
+    # If not provided, fall back to name (backwards compat).
+    site_name       = data.get("site_name") or name
 
     from agent.job import queue as _queue
     job_id = f"nfp-{name}-{uuid.uuid4().hex[:8]}"
     _queue("default").enqueue(
         _nfp_deploy,
         name, repo, branch, port, env_vars, deployment_mode, backend_url, job_id,
+        site_name=site_name,
         job_id=job_id,
         job_timeout=1800,
         result_ttl=86400,
