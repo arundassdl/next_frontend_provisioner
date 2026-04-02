@@ -32,20 +32,31 @@ _CONFIG_FILES       = ["next.config.js", "next.config.mjs", "next.config.ts", "n
 _STANDALONE_PATTERN = re.compile(r"""output\s*:\s*['"]standalone['"]""", re.IGNORECASE)
 
 _HEALTH_APP = textwrap.dedent("""\
-    // Injected by next_frontend_provisioner — do not remove.
-    // Required for container health checks.
-    export async function GET() {
-      return Response.json({ status: 'ok', ts: Date.now() })
-    }
+    import { NextResponse } from 'next/server'
+
+// Injected by next_frontend_provisioner — do not remove.
+// Required for container health checks.
+export async function GET() {
+  return NextResponse.json({
+    status: 'ok',
+    ts: Date.now(),
+  })
+}
 """)
 
 _HEALTH_PAGES = textwrap.dedent("""\
     // Injected by next_frontend_provisioner — do not remove.
     import type { NextApiRequest, NextApiResponse } from 'next'
 
-    export default function handler(_req: NextApiRequest, res: NextApiResponse) {
-      res.status(200).json({ status: 'ok', ts: Date.now() })
-    }
+export default function handler(
+  _req: NextApiRequest,
+  res: NextApiResponse
+) {
+  res.status(200).json({
+    status: 'ok',
+    ts: Date.now(),
+  })
+}
 """)
 
 
