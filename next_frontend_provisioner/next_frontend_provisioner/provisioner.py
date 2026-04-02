@@ -389,7 +389,7 @@ def dispatch_redeploy(site_name: str):
         "port":            doc.container_port,
         "env_vars":        _build_env_vars(doc),
         "deployment_mode": doc.deployment_mode,
-        "backend_url":     (doc.backend_url or "").rstrip("/"),,
+        "backend_url":     (doc.backend_url or "").rstrip("/"),
         "site_name":       doc.site_name or site_name,
     }
 
