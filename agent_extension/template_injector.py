@@ -80,7 +80,7 @@ def _inject_dockerfile(root: Path):
 
 def _inject_or_patch_next_config(root: Path, site_name: str):
     # copy app-config file
-    shutil.copy2(root /"services" /"config" / "app-config-example.ts", root /"services" /"config" / "app-config.ts")
+    shutil.copy2(root /"src" /"services" /"config" / "app-config-example.ts", root /"src" /"services" /"config" / "app-config.ts")
     existing = _find_config(root)
 
     if existing is None:
