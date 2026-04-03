@@ -185,8 +185,6 @@ def _nginx_reload_direct() -> None:
                 print(f"[NFP] nginx reloaded via: {' '.join(cmd)}")
                 return
             print(f"[NFP] nginx reload attempt failed ({' '.join(cmd)}): {r.stderr.strip()}")
-        # Try systemctl as fallback
-        subprocess.run(["systemctl", "reload", "nginx"], check=False, capture_output=True)
     except Exception as exc:
         print(f"[NFP] nginx reload error: {exc}")
 

@@ -36,6 +36,93 @@ next_frontend_provisioner/        ← Frappe app (install on Press controller be
   patches/
 ```
 
+```
+next_frontend_provisioner
+├── agent_extension
+│   ├── AGENT_INTEGRATION.md
+│   ├── agent_jobs.py
+│   ├── frontend_patch.py
+│   ├── nginx_utils.py
+│   ├── proxy_manager.py
+│   ├── template_injector.py
+│   └── web.py
+├── ansible
+│   ├── group_vars
+│   │   └── proxies.yml
+│   ├── inventory
+│   │   └── proxies.ini
+│   ├── proxy_nextjs_remove.yml
+│   ├── proxy_nextjs_rollback.yml
+│   ├── proxy_nextjs.yml
+│   ├── roles
+│   │   └── nextjs_proxy
+│   │       ├── defaults
+│   │       │   └── main.yml
+│   │       ├── handlers
+│   │       │   └── main.yml
+│   │       └── tasks
+│   │           ├── main.yml
+│   │           ├── provision.yml
+│   │           ├── remove.yml
+│   │           └── rollback.yml
+│   └── templates
+│       └── nextjs_proxy.conf.j2
+├── diagnose_nginx.sh
+├── fix_agent.py
+├── get_token.sh
+├── inspect_agent_job.sh
+├── install_agent_extension.sh
+├── MANIFEST.in
+├── next_frontend_provisioner
+│   ├── hooks.py
+│   ├── __init__.py
+│   ├── module_def.json
+│   ├── modules.txt
+│   ├── next_frontend_provisioner
+│   │   ├── api.py
+│   │   ├── docker_utils.py
+│   │   ├── doctype
+│   │   │   ├── deployment_log
+│   │   │   │   ├── deployment_log.json
+│   │   │   │   ├── deployment_log.py
+│   │   │   │   ├── __init__.py
+│   │   │   ├── deployment_log_entry
+│   │   │   │   ├── deployment_log_entry.json
+│   │   │   │   ├── deployment_log_entry.py
+│   │   │   │   ├── __init__.py
+│   │   │   ├── __init__.py
+│   │   │   ├── nextjs_env_variable
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── nextjs_env_variable.json
+│   │   │   │   ├── nextjs_env_variable.py
+│   │   │   └── nextjs_site
+│   │   │       ├── __init__.py
+│   │   │       ├── nextjs_site.json
+│   │   │       └── nextjs_site.py
+│   │   ├── __init__.py
+│   │   ├── nginx_utils.py
+│   │   ├── port_manager.py
+│   │   ├── press_hooks.py
+│   │   ├── provisioner.py
+│   │   ├── template_injector.py
+│   │   └── templates
+│   │       ├── docker
+│   │       │   ├── Dockerfile
+│   │       │   ├── health_route
+│   │       │   │   └── route.ts
+│   │       │   └── next.config.js
+│   │       └── nginx
+│   │           └── nextjs_upstream.conf
+│   ├── public
+│   │   └── js
+│   │       └── nextjs_site.js
+├── patches
+│   └── patches.txt
+├── README.md
+├── requirements.txt
+└── setup.py
+
+```
 ## Installation
 
 ```bash
