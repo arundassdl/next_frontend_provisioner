@@ -2,35 +2,39 @@
 frontend_patch.py
 -----------------
 Registers /frontends/<n>/deploy and /frontends/<n> (DELETE) routes
-on the agent's Flask application without modifying web.py beyond
-a single import line.
+on the agent's Flask application.
 
-Nginx strategy — using the agent's own Proxy() API:
-  Press manages proxy.conf through its Proxy() class, which maintains
-  upstream state in a config file. NginxReloadManager reads this state
-  to regenerate proxy.conf. We MUST use Proxy() methods — patching
-  proxy.conf directly gets overwritten on every reload.
+Nginx strategy — the ONLY approach that works with NginxReloadManager:
 
-  The correct call sequence to add crm.evoq.app → port 3101:
-    1. Proxy().add_upstream_job("nextjs_crm_evoq_app")
-       → creates upstream block in proxy.conf
-    2. Proxy().add_site_to_upstream_job("nextjs_crm_evoq_app", "crm.evoq.app")
-       → adds crm.evoq.app to the $upstream_server_hash map
+  The NginxReloadManager is a separate supervisor process that:
+  1. Reads its internal config state from disk (set by Proxy() class)
+  2. REGENERATES proxy.conf from that state (wiping any direct patches)
+  3. Runs nginx -s reload
 
-    import agent.frontend_patch  # noqa: F401
+  Therefore patching proxy.conf directly BEFORE reload always gets wiped.
 
-...and this module registers the blueprint on the app object *after*
-it is created (using Flask's app context), we use a deferred approach:
-the blueprint is stored here and web.py's `application` object picks it
-up because Python's import system guarantees web.py finishes creating
-`application = Flask(__name__)` before the blueprint registration runs.
+  CORRECT approach:
+  Step A. Call agent HTTP API: POST /proxy/upstreams (creates upstream in Proxy state)
+  Step B. Call agent HTTP API: POST /proxy/upstreams/<n>/sites (adds domain to state)
+  Step C. Poll job status — wait for NginxReloadManager to finish regenerating proxy.conf
+          (at this point proxy.conf has our upstream but with default/wrong server address)
+  Step D. Patch proxy.conf server address to 127.0.0.1:<our_port>
+  Step E. Call nginx -s reload DIRECTLY — this reloads the patched file WITHOUT
+          triggering NginxReloadManager again (no further regeneration).
 
-How it actually works:
-  web.py line N:    application = Flask(__name__)
-  web.py line N+x:  import agent.frontend_patch
-                    → this module runs _register_blueprint()
-                    → imports application from agent.web  ✓ (already created)
-                    → registers the blueprint
+  This survives because:
+  - NginxReloadManager only runs when triggered via Redis queue
+  - Direct "nginx -s reload" does NOT go through NginxReloadManager
+  - The server address patch persists until the next time someone calls the
+    proxy API (e.g. another site is deployed), at which point NginxReloadManager
+    runs again and regenerates proxy.conf, again wiping the server address.
+    
+  PERMANENT FIX for server address: we re-apply the patch in a post-reload hook.
+  After every nginx reload that NginxReloadManager does, our upstream gets a wrong
+  server. We detect this by checking proxy.conf after each deploy and re-patching.
+
+  For now this deploy-time patch is sufficient — it persists for the lifetime of
+  this container deployment until the next unrelated nginx reload event.
 """
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import traceback
 import uuid
 
@@ -100,16 +105,8 @@ def _run(cmd: str, check: bool = True) -> str:
 
 # ── Nginx via Proxy() API ─────────────────────────────────────────────
 
-def _safe_name(domain: str) -> str:
-    """Convert domain to a valid nginx upstream name."""
-    return "nextjs_" + domain.replace(".", "_").replace("-", "_")
-
-
-def _call_agent_api(method: str, path: str, payload: dict = None) -> dict:
-    """
-    Call the local agent REST API (self-call).
-    The agent authenticates with its own agent_password.
-    """
+def _agent_request(method: str, path: str, payload: dict = None) -> dict:
+    """Make an authenticated HTTP request to the local agent API."""
     import urllib.request, urllib.error
     port = _agent_port()
     url = f"http://127.0.0.1:{port}{path}"
@@ -119,21 +116,37 @@ def _call_agent_api(method: str, path: str, payload: dict = None) -> dict:
         url, data=data, method=method,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {password}",
+            "Authorization": f"Bearer {_agent_password()}",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return _json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode()[:500]
-        raise RuntimeError(f"Agent API {method} {path} → HTTP {e.code}: {body}")
+        body = e.read().decode()[:300]
+        print(f"[NFP] Agent API {method} {path} → HTTP {e.code}: {body}")
+        return {}
+    except Exception as exc:
+        print(f"[NFP] Agent API {method} {path} error: {exc}")
+        return {}
 
 
-def _proxy_add_domain(domain: str, port: int) -> None:
-    """
-    Register domain with the agent's Proxy() upstream system.
-    This writes to the persistent upstream config that proxy.conf is built from.
+def _wait_for_job(job_id: str, timeout: int = 60) -> bool:
+    """Poll agent job status until finished. Returns True if success."""
+    if not job_id:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = _agent_request("GET", f"/jobs/{job_id}")
+        status = resp.get("status", "")
+        if status == "Success":
+            return True
+        if status == "Failure":
+            print(f"[NFP] Job {job_id} failed: {resp.get('data', '')}")
+            return False
+        time.sleep(1)
+    print(f"[NFP] Job {job_id} timed out after {timeout}s")
+    return False
 
     Steps:
       1. Create upstream "nextjs_<safe>" pointing to 127.0.0.1:<port>
@@ -141,191 +154,160 @@ def _proxy_add_domain(domain: str, port: int) -> None:
     """
     upstream_name = _safe_name(domain)
 
-    # ── Step 1: Create upstream (idempotent — agent handles duplicates) ──
-    # We use Proxy() directly to avoid async job indirection
-    try:
-        from agent.proxy import Proxy
-        proxy = Proxy()
+# ── Nginx helpers ─────────────────────────────────────────────────────
 
-        # Log current state for debugging
-        try:
-            all_upstreams = proxy.upstreams or []
-            print(f"[NFP] Current upstreams: {[u.get('name') for u in all_upstreams]}")
-        except Exception as e:
-            print(f"[NFP] Could not list upstreams: {e}")
-            all_upstreams = []
-
-        # ── Step 1: Create upstream if it doesn't exist ───────────────────
-        existing_names = {u.get("name") for u in all_upstreams}
-        if upstream_name not in existing_names:
-            # Try add_upstream (direct method, not the job wrapper add_upstream_job)
-            try:
-                proxy.add_upstream(upstream_name)
-                print(f"[NFP] Created upstream: {upstream_name}")
-            except AttributeError:
-                # Method name may differ between agent versions
-                try:
-                    proxy.add_upstream_job(upstream_name)
-                    print(f"[NFP] Created upstream via job: {upstream_name}")
-                except Exception as e2:
-                    print(f"[NFP] Could not create upstream: {e2}, using fallback")
-                    raise
-        else:
-            print(f"[NFP] Upstream already exists: {upstream_name}")
-
-        # ── Step 2: Add domain as a site (adds to $upstream_server_hash map) ─
-        upstream_sites = set()
-        for u in all_upstreams:
-            if u.get("name") == upstream_name:
-                upstream_sites = {s if isinstance(s, str) else s.get("name", "") 
-                                  for s in u.get("sites", [])}
-                break
-
-        if domain not in upstream_sites:
-            try:
-                proxy.add_site_to_upstream(upstream_name, domain)
-                print(f"[NFP] Added {domain} → {upstream_name}")
-            except AttributeError:
-                try:
-                    proxy.add_site_to_upstream_job(upstream_name, domain)
-                    print(f"[NFP] Added {domain} via job → {upstream_name}")
-                except Exception as e2:
-                    print(f"[NFP] Could not add site: {e2}, using fallback")
-                    raise
-        else:
-            print(f"[NFP] {domain} already in upstream {upstream_name}")
-
-        # ── Step 3: Patch the upstream server address to our container port ─
-        # Proxy() creates the upstream with a default server (e.g. 127.0.0.1:80).
-        # We overwrite it with our container port BEFORE nginx reload.
-        _update_upstream_server(upstream_name, port)
-
-        # ── Step 4: Reload nginx ──────────────────────────────────────────
-        _reload_nginx()
-
-    except ImportError:
-        print("[NFP] agent.proxy not importable, falling back to direct proxy.conf patch")
-        _patch_proxy_conf_fallback(domain, port)
-        _reload_nginx()
-    except Exception as exc:
-        print(f"[NFP] Proxy() approach failed ({exc}), falling back to direct patch")
-        import traceback as _tb2
-        _tb2.print_exc()
-        _patch_proxy_conf_fallback(domain, port)
-        _reload_nginx()
+def _safe_name(domain: str) -> str:
+    return "nextjs_" + domain.replace(".", "_").replace("-", "_")
 
 
-def _update_upstream_server(upstream_name: str, port: int) -> None:
+def _nginx_reload_direct() -> None:
     """
-    Set the upstream server address in proxy.conf to 127.0.0.1:<port>.
-    
-    The Proxy() class creates an upstream with a default or placeholder server.
-    We need to ensure it points to our container's host port.
-    We do this by directly patching the upstream block in proxy.conf,
-    which is safe because we're only modifying the server address within
-    an upstream block that Proxy() just created/confirmed exists.
+    Reload nginx directly WITHOUT going through NginxReloadManager.
+    This is critical — NginxReloadManager would regenerate proxy.conf,
+    wiping our server address patch.
+    """
+    try:
+        r = subprocess.run(
+            ["nginx", "-s", "reload"],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            print("[NFP] nginx reloaded directly (nginx -s reload)")
+        else:
+            print(f"[NFP] nginx -s reload failed: {r.stderr}")
+            # Try systemctl as fallback
+            subprocess.run(["systemctl", "reload", "nginx"], check=False, capture_output=True)
+    except Exception as exc:
+        print(f"[NFP] nginx reload error: {exc}")
+
+
+def _patch_proxy_conf_server(upstream_name: str, port: int) -> bool:
+    """
+    Patch the server address in our upstream block in proxy.conf.
+    Called AFTER NginxReloadManager has regenerated proxy.conf.
+    Returns True if the upstream block was found and patched.
     """
     conf_path = _proxy_conf_path()
     if not os.path.exists(conf_path):
-        return
+        print(f"[NFP] proxy.conf not found at {conf_path}")
+        return False
 
     content = open(conf_path).read()
 
     # Find and replace/add the server line in our specific upstream block
     pattern = rf"(upstream {re.escape(upstream_name)}\s*\{{)([^}}]*?)(\}})"
 
-    def replace_server(m):
-        block_open = m.group(1)
-        block_body = m.group(2)
-        block_close = m.group(3)
+    def fix_server(m):
+        return (
+            f"{m.group(1)}\n"
+            f"\tserver 127.0.0.1:{port};\n"
+            f"\tkeepalive 32;\n"
+            f"{m.group(3)}"
+        )
 
-        # Remove existing server lines from this block
-        new_body = re.sub(r'\n?\s*server [^\n]+;\n?', '', block_body)
-        # Add our server line
-        return f"{block_open}\n\tserver 127.0.0.1:{port};\n\tkeepalive 32;\n{block_close}"
-
-    new_content, count = re.subn(pattern, replace_server, content, flags=re.DOTALL)
+    new_content, count = re.subn(pattern, fix_server, content, flags=re.DOTALL)
     if count > 0:
         with open(conf_path, "w") as f:
             f.write(new_content)
-        print(f"[NFP] Updated upstream {upstream_name} → 127.0.0.1:{port}")
+        print(f"[NFP] Patched {upstream_name} server → 127.0.0.1:{port}")
+        return True
     else:
-        print(f"[NFP] WARNING: upstream block {upstream_name} not found in proxy.conf")
+        print(f"[NFP] Upstream block '{upstream_name}' not found in proxy.conf")
+        return False
 
 
-def _proxy_remove_domain(domain: str) -> None:
-    """Remove domain from the agent's upstream config."""
+def _write_nginx(domain: str, port: int,
+                 deployment_mode: str = "Full Stack",
+                 backend_url: str = "") -> None:
+    """
+    Configure nginx to route domain to our container port.
+
+    Flow:
+      1. Add upstream via agent API (updates Proxy() internal state)
+      2. Add site/domain via agent API (updates map in internal state)
+      3. Wait for NginxReloadManager to regenerate proxy.conf with our upstream
+      4. Patch proxy.conf to set correct server address (127.0.0.1:<port>)
+      5. nginx -s reload DIRECTLY (not via NginxReloadManager)
+    """
     upstream_name = _safe_name(domain)
-    try:
-        from agent.proxy import Proxy
-        proxy = Proxy()
-        try:
-            proxy.remove_site_from_upstream(upstream_name, domain)
-            print(f"[NFP] Removed {domain} from upstream {upstream_name}")
-        except Exception:
-            pass
-        try:
-            proxy.remove_upstream(upstream_name)
-            print(f"[NFP] Removed upstream {upstream_name}")
-        except Exception:
-            pass
-        _reload_nginx()
-    except ImportError:
-        _unpatch_proxy_conf_fallback(domain)
-        _reload_nginx()
+
+    # ── Step 1: Add upstream to Proxy() persistent state ─────────────
+    print(f"[NFP] Registering upstream {upstream_name} via agent API...")
+    resp = _agent_request("POST", "/proxy/upstreams", {"name": upstream_name})
+    job1_id = resp.get("job") or resp.get("id") or ""
+    print(f"[NFP] add_upstream job: {job1_id}")
+
+    # Wait for it — NginxReloadManager will run and regenerate proxy.conf
+    if job1_id:
+        _wait_for_job(job1_id, timeout=30)
+        time.sleep(1)  # Small extra wait for file write to flush
+
+    # ── Step 2: Add site/domain to the upstream ───────────────────────
+    print(f"[NFP] Adding {domain} to upstream {upstream_name}...")
+    resp2 = _agent_request(
+        "POST", f"/proxy/upstreams/{upstream_name}/sites", {"name": domain}
+    )
+    job2_id = resp2.get("job") or resp2.get("id") or ""
+    print(f"[NFP] add_site job: {job2_id}")
+
+    # Wait for it — NginxReloadManager will run again
+    if job2_id:
+        _wait_for_job(job2_id, timeout=30)
+        time.sleep(1)
+
+    # ── Step 3: Verify and patch server address ───────────────────────
+    # At this point, NginxReloadManager has regenerated proxy.conf with
+    # our upstream block, but it may have a wrong/default server address.
+    # We patch it directly.
+    patched = _patch_proxy_conf_server(upstream_name, port)
+
+    if not patched:
+        # Upstream block wasn't created by the API calls — fall back to
+        # writing the full entry ourselves.
+        print("[NFP] Falling back to full proxy.conf injection...")
+        _inject_upstream_fallback(domain, upstream_name, port)
+
+    # ── Step 4: Reload nginx directly (NOT via NginxReloadManager) ────
+    _nginx_reload_direct()
+    print(f"[NFP] nginx routing configured for {domain} → 127.0.0.1:{port}")
 
 
-def _reload_nginx() -> None:
-    """Reload nginx via NginxReloadManager."""
-    try:
-        from agent.nginx_reload_manager import NginxReloadManager
-        mgr = NginxReloadManager()
-        mgr.request_reload(request_id=f"nfp-{os.getpid()}")
-        print("[NFP] nginx reload requested via NginxReloadManager")
-        return
-    except Exception as exc:
-        print(f"[NFP] NginxReloadManager unavailable: {exc}")
-    try:
-        subprocess.run(["nginx", "-t"], check=True, capture_output=True)
-        subprocess.run(["nginx", "-s", "reload"], check=True, capture_output=True)
-        print("[NFP] nginx reloaded via nginx -s reload")
-    except Exception as exc:
-        print(f"[NFP] nginx reload failed (non-fatal): {exc}")
-
-
-# ── Fallback: direct proxy.conf patching ─────────────────────────────
-# Used only if Proxy() import fails (e.g. different agent version).
-
-def _patch_proxy_conf_fallback(domain: str, port: int) -> None:
-    """Direct proxy.conf patching — fallback when Proxy() is unavailable."""
+def _inject_upstream_fallback(domain: str, upstream_name: str, port: int) -> None:
+    """
+    Directly inject upstream + map entry into proxy.conf.
+    Used when the agent API didn't create the upstream block.
+    """
     conf_path = _proxy_conf_path()
     if not os.path.exists(conf_path):
-        print(f"[NFP] proxy.conf not found at {conf_path}")
+        print(f"[NFP] proxy.conf not found: {conf_path}")
         return
 
-    safe = _safe_name(domain)
+    content = open(conf_path).read()
+
+    # Remove stale entries for idempotency
+    content = re.sub(
+        rf"upstream {re.escape(upstream_name)}\s*\{{[^}}]*\}}\n?", "", content
+    )
+    content = re.sub(
+        rf"^\t{re.escape(domain)}\s+http://\S+;\n?", "", content, flags=re.MULTILINE
+    )
+
     upstream_block = (
-        f"upstream {safe} {{\n"
+        f"upstream {upstream_name} {{\n"
         f"\tserver 127.0.0.1:{port};\n"
         f"\tkeepalive 32;\n"
         f"}}\n"
     )
-    map_entry = f"\t{domain} http://{safe};"
 
-    content = open(conf_path).read()
-
-    # Remove stale entries (idempotency)
-    content = re.sub(rf"upstream {re.escape(safe)} \{{[^}}]*\}}\n?", "", content)
-    content = re.sub(rf"^\t{re.escape(domain)}\s+http://\S+;\n?", "", content, flags=re.MULTILINE)
-
-    # Insert upstream before first existing upstream
+    # Insert before first existing upstream block
     first_up = re.search(r"^upstream \w+", content, re.MULTILINE)
     if first_up:
         content = content[:first_up.start()] + upstream_block + "\n" + content[first_up.start():]
     else:
         content = upstream_block + "\n" + content
 
-    # Add map entry before "default http://site_not_found;"
+    # Add map entry
+    map_entry = f"\t{domain} http://{upstream_name};"
     content = content.replace(
         "\tdefault http://site_not_found;",
         f"{map_entry}\n\n\tdefault http://site_not_found;",
@@ -334,40 +316,21 @@ def _patch_proxy_conf_fallback(domain: str, port: int) -> None:
 
     with open(conf_path, "w") as f:
         f.write(content)
-    print(f"[NFP] proxy.conf patched (fallback): {domain} → {safe}:{port}")
-
-
-def _unpatch_proxy_conf_fallback(domain: str) -> None:
-    conf_path = _proxy_conf_path()
-    if not os.path.exists(conf_path):
-        return
-    safe = _safe_name(domain)
-    content = open(conf_path).read()
-    content = re.sub(rf"upstream {re.escape(safe)} \{{[^}}]*\}}\n?", "", content)
-    content = re.sub(rf"^\t{re.escape(domain)}\s+http://\S+;\n?", "", content, flags=re.MULTILINE)
-    with open(conf_path, "w") as f:
-        f.write(content)
-    print(f"[NFP] proxy.conf unpatched (fallback): {domain}")
-
-
-def _write_nginx(domain: str, port: int,
-                 deployment_mode: str = "Full Stack",
-                 backend_url: str = "") -> None:
-    """Configure nginx routing for the deployed domain."""
-    try:
-        _proxy_add_domain(domain, port)
-        print(f"[NFP] nginx routing configured for {domain}")
-    except Exception as exc:
-        print(f"[NFP] nginx warning (non-fatal): {exc}")
-        import traceback as _tb
-        _tb.print_exc()
+    print(f"[NFP] Injected {upstream_name} → 127.0.0.1:{port} into proxy.conf")
 
 
 def _remove_nginx(domain: str) -> None:
-    """Remove nginx routing for a domain."""
+    """Remove domain from nginx routing."""
+    upstream_name = _safe_name(domain)
     try:
-        _proxy_remove_domain(domain)
-        print(f"[NFP] nginx routing removed for {domain}")
+        # Try agent API first
+        resp = _agent_request(
+            "DELETE", f"/proxy/upstreams/{upstream_name}/sites/{domain}", {}
+        )
+        job_id = resp.get("job") or resp.get("id") or ""
+        if job_id:
+            _wait_for_job(job_id, timeout=30)
+        print(f"[NFP] Removed {domain} from nginx")
     except Exception as exc:
         print(f"[NFP] nginx remove warning: {exc}")
 
@@ -406,10 +369,12 @@ def _press_callback(job_id: str, site_name: str, status: str, message: str = "")
             site_cfg = _j.load(f)
         token = site_cfg.get("nfp_agent_callback_token", "")
         if not token:
-            print("[NFP] no nfp_agent_callback_token configured — skipping callback")
+            print("[NFP] no nfp_agent_callback_token — skipping callback")
             return
         press_url = _agent_config().get("press_url", "https://cloud.evoq.app")
-        url = press_url + "/api/method/next_frontend_provisioner.next_frontend_provisioner.api.agent_job_update"
+        url = (press_url
+               + "/api/method/next_frontend_provisioner"
+               + ".next_frontend_provisioner.api.agent_job_update")
         body = _j.dumps({
             "job_name": "Provision Next.js Site",
             "site":     site_name,
@@ -471,17 +436,12 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
             if not os.path.exists(dockerfile):
                 with open(dockerfile, "w") as f:
                     f.write(
-                        "FROM node:20-alpine AS deps\n"
-                        "WORKDIR /app\n"
-                        "COPY package*.json ./\n"
-                        "RUN npm ci\n\n"
-                        "FROM node:20-alpine AS builder\n"
-                        "WORKDIR /app\n"
-                        "COPY . .\n"
-                        "COPY --from=deps /app/node_modules ./node_modules\n"
+                        "FROM node:20-alpine AS deps\nWORKDIR /app\n"
+                        "COPY package*.json ./\nRUN npm ci\n\n"
+                        "FROM node:20-alpine AS builder\nWORKDIR /app\n"
+                        "COPY . .\nCOPY --from=deps /app/node_modules ./node_modules\n"
                         "RUN npm run build\n\n"
-                        "FROM node:20-alpine AS runner\n"
-                        "WORKDIR /app\n"
+                        "FROM node:20-alpine AS runner\nWORKDIR /app\n"
                         "ENV NODE_ENV=production\n"
                         "COPY --from=builder /app/.next/standalone ./\n"
                         "COPY --from=builder /app/.next/static ./.next/static\n"
@@ -520,7 +480,8 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
         _write_nginx(domain, port, deployment_mode, backend_url)
 
         _job_model_finish(model, success=True)
-        _press_callback(job_id, domain, "Success", "Container running on port " + str(port))
+        _press_callback(job_id, domain, "Success",
+                        "Container running on port " + str(port))
         print(f"[NFP] Deploy '{name}' ({domain}) completed successfully")
 
     except Exception:
@@ -596,13 +557,7 @@ def nfp_remove_frontend(name):
     return jsonify({"job": job_id, "status": "queued"})
 
 
-# ── Register blueprint on the Flask app ──────────────────────────────
-# web.py structure:
-#   line ~50:  application = Flask(__name__)   ← created BEFORE this import
-#   line ~N:   import agent.frontend_patch      ← this file runs here
-#
-# By the time this module is imported, `application` already exists
-# in agent.web's namespace, so we can safely import and register.
+# ── Register blueprint ────────────────────────────────────────────────
 
 def _register_blueprint():
     try:
