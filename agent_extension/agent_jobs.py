@@ -69,6 +69,18 @@ def _wait_healthy(url: str, retries: int = 20, delay: float = 5.0):
     raise RuntimeError(f"Container not healthy after {retries * delay:.0f}s — {url}")
 
 
+def _nginx_conf_dir(config: dict) -> str:
+    """
+    Resolve the directory where NFP writes its .nextjs.conf files.
+
+    Uses the agent's nginx_directory from config.json. For co-located
+    deployments (app server = proxy server) this is the nginx root dir
+    itself, not the hosts/ subdirectory (hosts/ is for per-site SSL certs).
+    """
+    nginx_dir = config.get("nginx_directory", "/home/frappe/agent/nginx")
+    return nginx_dir
+
+
 # ── Mixin ─────────────────────────────────────────────────────────────
 
 class NextjsMixin:
@@ -93,7 +105,7 @@ class NextjsMixin:
         cache_dir = _ensure_cache_dir(site)
         self._nextjs_start_container(name, tag, container_port, env_vars, cache_dir)
         self._nextjs_wait_healthy(site, container_port)
-        self._nextjs_write_nginx(site, name, container_port, deployment_mode, backend_url)
+        self._nextjs_write_nginx(site, container_port, deployment_mode, backend_url)
         self._nextjs_push_proxy(site, container_port, app_server_private_ip,
                                 proxy_hosts or [], press_callback_url, press_callback_token)
         return {"status": "Running", "container": name, "port": container_port,
@@ -153,7 +165,7 @@ class NextjsMixin:
             detach=True, restart_policy={"Name": "unless-stopped"},
         )
         _wait_healthy(f"http://localhost:{temp_port}/api/health")
-        self._nextjs_write_nginx(site, next_name, temp_port, deployment_mode, backend_url)
+        self._nextjs_write_nginx(site, temp_port, deployment_mode, backend_url)
 
         # Drain old container, restart new one on canonical port + name
         _remove_container(c, base, timeout=15)
@@ -166,7 +178,7 @@ class NextjsMixin:
             detach=True, restart_policy={"Name": "unless-stopped"},
         )
         _wait_healthy(f"http://localhost:{container_port}/api/health")
-        self._nextjs_write_nginx(site, base, container_port, deployment_mode, backend_url)
+        self._nextjs_write_nginx(site, container_port, deployment_mode, backend_url)
         self._nextjs_push_proxy(site, container_port, app_server_private_ip,
                                 proxy_hosts or [], press_callback_url, press_callback_token)
 
@@ -233,14 +245,25 @@ class NextjsMixin:
         _wait_healthy(f"http://localhost:{port}/api/health")
 
     @step("Write nginx Config")
-    def _nextjs_write_nginx(self, site: str, container_name: str, port: int,
+    def _nextjs_write_nginx(self, site: str, port: int,
                             deployment_mode: str = "Full Stack",
                             backend_url: str = ""):
+        """
+        Write the nginx upstream config for this site.
+
+        Uses app_server_ip="127.0.0.1" because in the standard Frappe Cloud
+        setup the Docker container is bound to 127.0.0.1:<port> on the same
+        host as nginx. Pass app_server_ip explicitly if your proxy is remote.
+
+        conf_dir is resolved from the agent's nginx_directory config key.
+        """
         from agent.nginx_utils import write_upstream
+        conf_dir = _nginx_conf_dir(self.config)
         write_upstream(
             site_name=site,
-            container_name=container_name,
             port=port,
+            conf_dir=conf_dir,
+            app_server_ip="127.0.0.1",
             deployment_mode=deployment_mode,
             backend_url=backend_url,
         )
@@ -248,7 +271,8 @@ class NextjsMixin:
     @step("Remove nginx Config")
     def _nextjs_remove_nginx(self, site: str):
         from agent.nginx_utils import remove_upstream
-        remove_upstream(site)
+        conf_dir = _nginx_conf_dir(self.config)
+        remove_upstream(site_name=site, conf_dir=conf_dir)
 
     @step("Push Proxy Config")
     def _nextjs_push_proxy(self, site: str, port: int, app_server_private_ip: str,
