@@ -148,11 +148,6 @@ def _wait_for_job(job_id: str, timeout: int = 60) -> bool:
     print(f"[NFP] Job {job_id} timed out after {timeout}s")
     return False
 
-    Steps:
-      1. Create upstream "nextjs_<safe>" pointing to 127.0.0.1:<port>
-      2. Add site "<domain>" to that upstream (adds map entry)
-    """
-    upstream_name = _safe_name(domain)
 
 # ── Nginx helpers ─────────────────────────────────────────────────────
 
