@@ -46,6 +46,7 @@ import subprocess
 import time
 import traceback
 import uuid
+import base64 as _b64
 
 from flask import Blueprint, jsonify, request
 
@@ -111,14 +112,17 @@ def _agent_request(method: str, path: str, payload: dict = None) -> dict:
     port = _agent_port()
     url = f"http://127.0.0.1:{port}{path}"
     password = _agent_password()
+    # Agent uses HTTP Basic Auth: username="agent", password=<agent_password>
+    credentials = _b64.b64encode(f"agent:{password}".encode()).decode()
     data = _json.dumps(payload or {}).encode()
     req = urllib.request.Request(
         url, data=data, method=method,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {_agent_password()}",
+            "Authorization": f"Basic {credentials}",  # ← was Bearer
         },
     )
+
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return _json.loads(resp.read())
@@ -162,16 +166,27 @@ def _nginx_reload_direct() -> None:
     wiping our server address patch.
     """
     try:
-        r = subprocess.run(
+        # r = subprocess.run(
+        #     ["nginx", "-s", "reload"],
+        #     capture_output=True, text=True
+        # )
+        # if r.returncode == 0:
+        #     print("[NFP] nginx reloaded directly (nginx -s reload)")
+        # else:
+        #     print(f"[NFP] nginx -s reload failed: {r.stderr}")
+
+        for cmd in [
+            ["sudo", "nginx", "-s", "reload"],
             ["nginx", "-s", "reload"],
-            capture_output=True, text=True
-        )
-        if r.returncode == 0:
-            print("[NFP] nginx reloaded directly (nginx -s reload)")
-        else:
-            print(f"[NFP] nginx -s reload failed: {r.stderr}")
-            # Try systemctl as fallback
-            subprocess.run(["systemctl", "reload", "nginx"], check=False, capture_output=True)
+            ["systemctl", "reload", "nginx"],
+        ]:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"[NFP] nginx reloaded via: {' '.join(cmd)}")
+                return
+            print(f"[NFP] nginx reload attempt failed ({' '.join(cmd)}): {r.stderr.strip()}")
+        # Try systemctl as fallback
+        subprocess.run(["systemctl", "reload", "nginx"], check=False, capture_output=True)
     except Exception as exc:
         print(f"[NFP] nginx reload error: {exc}")
 
@@ -224,6 +239,16 @@ def _write_nginx(domain: str, port: int,
       4. Patch proxy.conf to set correct server address (127.0.0.1:<port>)
       5. nginx -s reload DIRECTLY (not via NginxReloadManager)
     """
+    # NEW: Remove stale per-site conf file that confuses nginx
+    hosts_dir = os.path.join(_nginx_dir(), "hosts")
+    for candidate in [
+        os.path.join(hosts_dir, f"{domain.split('.')[0]}.nextjs.conf"),
+        os.path.join(hosts_dir, f"{domain}.conf"),
+    ]:
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+            print(f"[NFP] Removed stale conf file: {candidate}")
+
     upstream_name = _safe_name(domain)
 
     # ── Step 1: Add upstream to Proxy() persistent state ─────────────
