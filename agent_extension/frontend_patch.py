@@ -4,50 +4,67 @@ frontend_patch.py
 Registers /frontends/<n>/deploy and /frontends/<n> (DELETE) routes
 on the agent's Flask application.
 
-HOW NGINX ROUTING WORKS IN THIS SYSTEM
-=======================================
+NGINX STRATEGY — PURE proxy.conf PATCHING
+==========================================
 
-The NginxReloadManager is a supervisor process that:
-  1. Calls Proxy()._generate_proxy_config()
-  2. Proxy() reads its state from disk:
-       nginx/upstreams/<server_ip>/<site_domain>  (empty files)
-       nginx/hosts/*.evoq.app/map.json            (domain → server_ip)
-  3. Generates proxy.conf from that state
-  4. Runs nginx -s reload (as root, with letsencrypt cert access)
+Root cause of all previous failures:
+  NginxReloadManager calls Proxy()._generate_proxy_config() which reads
+  state from nginx/upstreams/ and nginx/hosts/*/map.json and REGENERATES
+  proxy.conf from scratch — wiping any direct patches.
 
-Proxy() only knows about server IPs (port 80). It has no concept of
-custom ports. So we cannot use Proxy() to route crm.evoq.app → port 3101.
+  When we added crm.evoq.app to map.json pointing at 127.0.0.1, Proxy()
+  generated a $actual_host map entry:
+      crm.evoq.app 127.0.0.1;
+  This transforms $host → "127.0.0.1" before the upstream lookup, which
+  then resolves to upstream 2f8748abdbb42c16 (port 80) — breaking routing.
 
-THE CORRECT 4-STEP APPROACH
-============================
+CORRECT APPROACH (used here):
+  1. Do NOT touch Proxy() state files (upstreams/ or map.json).
+     Proxy() state is for Frappe sites only — not Next.js containers.
+  2. Patch proxy.conf AFTER NginxReloadManager has finished its cycle:
+       a. Insert: upstream nextjs_<safe> { server 127.0.0.1:<port>; }
+       b. Add/replace map entries in $upstream_server_hash
+       c. Add/replace map entries in $socket_upstream_hash
+       d. Remove any stale $actual_host map entry for this domain
+          (Proxy() should not know about this domain at all)
+  3. Reload nginx DIRECTLY via sudo (not via NginxReloadManager).
+     Requires sudoers entry — see SUDOERS SETUP below.
+  4. On the next unrelated NginxReloadManager run, our custom upstream
+     block will be wiped again. This is acceptable because:
+       - The state files don't exist → Proxy() won't add this domain
+       - The next deploy of our site will re-patch proxy.conf
+       - For long-running stability between deploys, see PERMANENT FIX.
 
-Step 1 — Write Proxy() state files for our domain:
-    touch nginx/upstreams/127.0.0.1/crm.evoq.app
-    map.json: {"crm.evoq.app": "127.0.0.1", "default": "$host"}
+PERMANENT FIX (optional, for production):
+  Monkey-patch Proxy._generate_proxy_config to re-apply our custom
+  upstream blocks after generation. See _install_proxy_patch() below.
+  This ensures the patch survives ANY NginxReloadManager cycle.
 
-  This ensures NginxReloadManager always includes crm.evoq.app in
-  proxy.conf (pointing to the hashed 127.0.0.1 upstream at port 80).
-  Without this, NginxReloadManager wipes our domain on every run.
+SUDOERS SETUP (required once):
+  echo "frappe ALL=(root) NOPASSWD: /usr/sbin/nginx -s reload" \
+    | sudo tee /etc/sudoers.d/frappe-nginx-reload
+  sudo chmod 440 /etc/sudoers.d/frappe-nginx-reload
 
-Step 2 — Let NginxReloadManager regenerate proxy.conf with our domain:
-    mgr.request_reload() → Proxy()._generate_proxy_config() runs
-    proxy.conf now has crm.evoq.app → http://<hash_of_127.0.0.1>
-
-Step 3 — Wait for reload to complete, then patch proxy.conf:
-  Replace the hashed upstream entry for crm.evoq.app with our custom
-  nextjs upstream block pointing to 127.0.0.1:3101.
-
-Step 4 — Reload nginx DIRECTLY (nginx -s reload via sudo):
-  This reloads the patched proxy.conf WITHOUT triggering NginxReloadManager
-  again (which would wipe our port patch).
-
-SUDOERS REQUIREMENT
-===================
-For step 4 to work without password prompt, add this line:
-
-    echo "frappe ALL=(root) NOPASSWD: /usr/sbin/nginx -s reload" \
-      | sudo tee /etc/sudoers.d/frappe-nginx-reload
-    sudo chmod 440 /etc/sudoers.d/frappe-nginx-reload
+CLEANUP REQUIRED (run once on server to fix poisoned state):
+  python3 - << 'PY'
+  import json, glob
+  # Remove crm.evoq.app from map.json
+  for p in glob.glob("/home/frappe/agent/nginx/hosts/*/map.json"):
+      d = json.load(open(p))
+      changed = False
+      for k in list(d):
+          if k not in ("default",) and not k.startswith("*"):
+              # Remove NFP domains — Proxy() should not know about them
+              pass  # only remove specific ones:
+      if "crm.evoq.app" in d:
+          del d["crm.evoq.app"]
+          json.dump(d, open(p, "w"), indent=4)
+          print("Cleaned map.json:", p)
+  # Remove site file
+  import os
+  f = "/home/frappe/agent/nginx/upstreams/127.0.0.1/crm.evoq.app"
+  if os.path.exists(f): os.remove(f); print("Removed:", f)
+  PY
 """
 from __future__ import annotations
 
@@ -66,6 +83,10 @@ from flask import Blueprint, jsonify, request
 
 # ── Blueprint ─────────────────────────────────────────────────────────
 _bp = Blueprint("nfp_frontends", __name__)
+
+# ── In-memory registry of NFP domains → ports (for the monkey-patch) ─
+# {domain: port}  e.g. {"crm.evoq.app": 3101}
+_NFP_REGISTRY: dict[str, int] = {}
 
 
 # ── Config helpers ────────────────────────────────────────────────────
@@ -105,70 +126,33 @@ def _run(cmd: str, check: bool = True) -> str:
     return r.stdout.strip()
 
 
-# ── Proxy() state management ──────────────────────────────────────────
-#
-# Proxy() reads its upstream state from the filesystem:
-#   upstreams/<server_ip>/          → directory per upstream IP
-#   upstreams/<server_ip>/<domain>  → empty file per site on that upstream
-#   hosts/*.evoq.app/map.json       → {"domain": "server_ip", "default": "$host"}
-#
-# We use 127.0.0.1 as the upstream IP. Proxy() will route the domain to
-# its hashed 127.0.0.1 upstream (port 80). We then patch the port.
+# ── Proxy() state cleanup ─────────────────────────────────────────────
 
-_UPSTREAM_IP = "127.0.0.1"
-
-
-def _write_proxy_state(domain: str) -> None:
+def _cleanup_proxy_state(domain: str) -> None:
     """
-    Write Proxy() state files so NginxReloadManager permanently includes
-    this domain in every proxy.conf regeneration.
+    Remove any Proxy() state files for this domain.
+
+    Previous versions of this code wrote:
+      - upstreams/127.0.0.1/<domain>   (empty file)
+      - hosts/*/map.json               (domain → 127.0.0.1 entry)
+
+    These cause Proxy() to generate a $actual_host map entry that
+    transforms $host → "127.0.0.1", breaking upstream lookup entirely.
+    We must remove them so Proxy() never knows about NFP domains.
     """
-    nginx_dir    = _nginx_dir()
-    upstream_dir = os.path.join(nginx_dir, "upstreams", _UPSTREAM_IP)
-    os.makedirs(upstream_dir, exist_ok=True)
-
-    # Empty file — Proxy() reads the filename as the site name
-    site_file = os.path.join(upstream_dir, domain)
-    open(site_file, "a").close()  # touch
-    print(f"[NFP] Proxy state: upstreams/{_UPSTREAM_IP}/{domain} ✓")
-
-    # map.json: domain → upstream IP
-    map_files = (
-        glob.glob(os.path.join(nginx_dir, "hosts", "*.evoq.app", "map.json")) +
-        glob.glob(os.path.join(nginx_dir, "hosts", "*",           "map.json"))
-    )
-    # Deduplicate
-    map_files = list(dict.fromkeys(map_files))
-
-    if not map_files:
-        print(f"[NFP] Warning: no map.json found under {nginx_dir}/hosts/")
-        return
-
-    map_path = map_files[0]
-    try:
-        with open(map_path) as f:
-            map_data = _json.load(f)
-    except (ValueError, FileNotFoundError):
-        map_data = {"default": "$host"}
-
-    if map_data.get(domain) != _UPSTREAM_IP:
-        map_data[domain] = _UPSTREAM_IP
-        with open(map_path, "w") as f:
-            _json.dump(map_data, f, indent=4)
-        print(f"[NFP] Proxy state: map.json → {domain}: {_UPSTREAM_IP} ✓")
-    else:
-        print(f"[NFP] Proxy state: map.json already has {domain}")
-
-
-def _remove_proxy_state(domain: str) -> None:
-    """Remove Proxy() state files for a domain on teardown."""
     nginx_dir = _nginx_dir()
 
-    site_file = os.path.join(nginx_dir, "upstreams", _UPSTREAM_IP, domain)
-    if os.path.exists(site_file):
-        os.remove(site_file)
-        print(f"[NFP] Proxy state: removed upstreams/{_UPSTREAM_IP}/{domain}")
+    # Remove site file from upstreams/
+    for upstream_dir in glob.glob(os.path.join(nginx_dir, "upstreams", "*")):
+        site_file = os.path.join(upstream_dir, domain)
+        if os.path.isfile(site_file):
+            try:
+                os.remove(site_file)
+                print(f"[NFP] Cleaned Proxy() state: removed {site_file}")
+            except OSError as e:
+                print(f"[NFP] Warning removing {site_file}: {e}")
 
+    # Remove domain from map.json
     for map_path in glob.glob(os.path.join(nginx_dir, "hosts", "*", "map.json")):
         try:
             with open(map_path) as f:
@@ -177,58 +161,9 @@ def _remove_proxy_state(domain: str) -> None:
                 del data[domain]
                 with open(map_path, "w") as f:
                     _json.dump(data, f, indent=4)
-                print(f"[NFP] Proxy state: removed {domain} from {map_path}")
-        except Exception as exc:
-            print(f"[NFP] Warning updating {map_path}: {exc}")
-
-
-# ── Nginx reload helpers ──────────────────────────────────────────────
-
-def _trigger_nginxreloadmanager_and_wait() -> bool:
-    """
-    Ask NginxReloadManager to regenerate proxy.conf (synchronous wait).
-    Returns True if successful.
-
-    After this, proxy.conf will contain our domain but pointing to the
-    hashed 127.0.0.1 upstream (port 80). We fix the port next.
-    """
-    try:
-        from agent.nginx_reload_manager import NginxReloadManager
-        mgr = NginxReloadManager()
-        mgr.request_reload(request_id=f"nfp-{os.getpid()}")
-        print("[NFP] NginxReloadManager: reload requested")
-        # Give it time to regenerate proxy.conf and reload nginx
-        time.sleep(3)
-        print("[NFP] NginxReloadManager: cycle complete")
-        return True
-    except Exception as exc:
-        print(f"[NFP] NginxReloadManager unavailable: {exc}")
-        return False
-
-
-def _reload_nginx_direct() -> bool:
-    """
-    Reload nginx directly WITHOUT going through NginxReloadManager.
-    Tries sudo (requires sudoers entry) then plain nginx -s reload.
-    """
-    for cmd in [
-        ["sudo", "/usr/sbin/nginx", "-s", "reload"],
-        ["sudo", "nginx", "-s", "reload"],
-        ["/usr/sbin/nginx", "-s", "reload"],
-        ["nginx", "-s", "reload"],
-    ]:
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            stderr = r.stderr.strip()
-            # returncode 0 = success; non-zero with only warnings = also success
-            if r.returncode == 0 or (r.returncode != 0 and "emerg" not in stderr and "error:" not in stderr.lower()):
-                print(f"[NFP] nginx reloaded via: {' '.join(cmd)}")
-                return True
-            print(f"[NFP] nginx reload failed ({' '.join(cmd)}): {stderr[:200]}")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    print("[NFP] WARNING: all nginx reload methods failed")
-    return False
+                print(f"[NFP] Cleaned Proxy() state: removed {domain} from {map_path}")
+        except Exception as e:
+            print(f"[NFP] Warning updating {map_path}: {e}")
 
 
 # ── Nginx proxy.conf patching ─────────────────────────────────────────
@@ -253,20 +188,23 @@ def _clean_stale_conf_files(domain: str) -> None:
             try:
                 os.remove(path)
                 print(f"[NFP] Removed stale conf file: {path}")
-            except OSError as exc:
-                print(f"[NFP] Warning removing {path}: {exc}")
+            except OSError as e:
+                print(f"[NFP] Warning removing {path}: {e}")
 
 
-def _patch_proxy_conf_port(domain: str, port: int) -> bool:
+def _patch_proxy_conf(domain: str, port: int) -> bool:
     """
-    After NginxReloadManager regenerates proxy.conf, our domain points to
-    the hashed 127.0.0.1 upstream (port 80). This function:
+    Patch proxy.conf to route domain → Next.js container port.
 
-      1. Inserts upstream nextjs_<safe> { server 127.0.0.1:<port>; }
-      2. Replaces all "<domain> http://..." map entries to point to our
-         custom upstream instead of the hashed 127.0.0.1 one.
+    Adds/updates:
+      upstream nextjs_<safe> { server 127.0.0.1:<port>; keepalive 32; }
+      <domain> http://nextjs_<safe>;  ← in $upstream_server_hash
+      <domain> http://nextjs_<safe>;  ← in $socket_upstream_hash
 
-    This is idempotent and safe to call repeatedly.
+    Also removes any stale $actual_host map entry for this domain
+    (written by old versions of this code via map.json → Proxy()).
+
+    Idempotent: safe to call on every deploy.
     """
     proxy_conf = _proxy_conf_path()
     if not os.path.exists(proxy_conf):
@@ -281,52 +219,55 @@ def _patch_proxy_conf_port(domain: str, port: int) -> bool:
         f"\tkeepalive 32;\n"
         f"}}\n"
     )
+    map_entry = f"\t{domain} http://{upstream_name};"
 
     content = open(proxy_conf).read()
 
-    # Remove any stale nextjs block for this domain
+    # ── 1. Remove stale nextjs upstream block (idempotency) ──────────
     content = re.sub(
         rf"upstream {re.escape(upstream_name)} \{{[^}}]*\}}\n?",
         "", content,
     )
 
-    # Insert custom upstream before first existing upstream
+    # ── 2. Remove stale $actual_host map entry (from old map.json approach) ──
+    # This entry routes $host → "127.0.0.1" which breaks upstream lookup.
+    content = re.sub(
+        rf"^\s*{re.escape(domain)}\s+127\.0\.0\.1;\s*\n?",
+        "", content, flags=re.MULTILINE,
+    )
+
+    # ── 3. Remove stale domain entries pointing to wrong upstream ─────
+    # Replace any existing domain map entries (will re-add below)
+    content = re.sub(
+        rf"^\s*{re.escape(domain)}\s+http://\S+;\s*\n?",
+        "", content, flags=re.MULTILINE,
+    )
+
+    # ── 4. Insert our custom upstream before first existing upstream ──
     first = re.search(r"^upstream \w+", content, re.MULTILINE)
     if first:
         content = content[:first.start()] + upstream_block + "\n" + content[first.start():]
     else:
         content = upstream_block + "\n" + content
 
-    # Replace domain's map entries: whatever IP/upstream they point to → our upstream
-    # This covers both $upstream_server_hash and $socket_upstream_hash maps
-    replaced = re.subn(
-        rf"(^\s*{re.escape(domain)}\s+)http://\S+;",
-        rf"\g<1>http://{upstream_name};",
-        content,
-        flags=re.MULTILINE,
+    # ── 5. Add entry to $upstream_server_hash ─────────────────────────
+    content = content.replace(
+        "\tdefault http://site_not_found;",
+        f"{map_entry}\n\n\tdefault http://site_not_found;",
+        1,  # first occurrence = upstream_server_hash map
     )
-    content, n_replaced = replaced
 
-    if n_replaced == 0:
-        # Domain wasn't in proxy.conf yet — add entries manually
-        print(f"[NFP] {domain} not found in proxy.conf maps, adding manually")
-        map_entry = f"\t{domain} http://{upstream_name};"
-        content = content.replace(
-            "\tdefault http://site_not_found;",
-            f"{map_entry}\n\n\tdefault http://site_not_found;",
-            1,
-        )
-        # Socket map
-        socket = re.search(
-            r"(map \$actual_host \$socket_upstream_hash \{[^}]*?)"
-            r"(default http://site_not_found;)",
-            content, re.DOTALL,
-        )
-        if socket:
-            entry = f"\t{domain} http://{upstream_name};\n"
-            if entry.strip() not in content:
-                pos = socket.start(2)
-                content = content[:pos] + entry + "    " + content[pos:]
+    # ── 6. Add entry to $socket_upstream_hash (websockets) ───────────
+    socket = re.search(
+        r"(map \$actual_host \$socket_upstream_hash \{[^}]*?)"
+        r"(default http://site_not_found;)",
+        content, re.DOTALL,
+    )
+    if socket:
+        entry = f"\t{domain} http://{upstream_name};\n"
+        if entry.strip() not in content:
+            pos = socket.start(2)
+            content = content[:pos] + entry + "    " + content[pos:]
 
     with open(proxy_conf, "w") as f:
         f.write(content)
@@ -335,7 +276,7 @@ def _patch_proxy_conf_port(domain: str, port: int) -> bool:
 
 
 def _unpatch_proxy_conf(domain: str) -> None:
-    """Remove a domain's custom upstream block and map entries."""
+    """Remove all NFP entries for a domain from proxy.conf."""
     proxy_conf = _proxy_conf_path()
     if not os.path.exists(proxy_conf):
         return
@@ -343,50 +284,171 @@ def _unpatch_proxy_conf(domain: str) -> None:
     upstream_name = f"nextjs_{safe}"
     content = open(proxy_conf).read()
     content = re.sub(rf"upstream {re.escape(upstream_name)} \{{[^}}]*\}}\n?", "", content)
-    content = re.sub(rf"^\s*{re.escape(domain)}\s+http://\S+;\n?", "", content, flags=re.MULTILINE)
+    content = re.sub(rf"^\s*{re.escape(domain)}\s+\S+;\s*\n?", "", content, flags=re.MULTILINE)
     open(proxy_conf, "w").write(content)
-    print(f"[NFP] proxy.conf: removed {domain} entries")
+    print(f"[NFP] proxy.conf: removed all entries for {domain}")
 
+
+# ── Nginx reload ──────────────────────────────────────────────────────
+
+def _reload_nginx_direct() -> bool:
+    """
+    Reload nginx directly WITHOUT NginxReloadManager.
+
+    Uses sudo (requires sudoers entry). Falls back to plain nginx -s reload.
+    Does NOT trigger NginxReloadManager, so proxy.conf stays patched.
+    """
+    for cmd in [
+        ["sudo", "/usr/sbin/nginx", "-s", "reload"],
+        ["sudo", "nginx", "-s", "reload"],
+        ["/usr/sbin/nginx", "-s", "reload"],
+        ["nginx", "-s", "reload"],
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            stderr = r.stderr.strip()
+            # returncode 0 = clean; non-zero with only ssl_stapling warnings = also OK
+            is_fatal = r.returncode != 0 and (
+                "emerg" in stderr or "[error]" in stderr.lower()
+            )
+            if not is_fatal:
+                print(f"[NFP] nginx reloaded via: {' '.join(cmd)}")
+                return True
+            print(f"[NFP] nginx reload failed ({' '.join(cmd)}): {stderr[:300]}")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    print("[NFP] WARNING: all nginx reload methods failed")
+    return False
+
+
+# ── Proxy() monkey-patch (permanent fix) ─────────────────────────────
+
+def _install_proxy_patch() -> None:
+    """
+    Monkey-patch Proxy._generate_proxy_config so that after every
+    NginxReloadManager-triggered regeneration, our custom upstream
+    blocks are immediately re-applied.
+
+    This makes the routing survive ANY future NginxReloadManager cycle
+    without requiring a re-deploy.
+    """
+    try:
+        from agent.proxy import Proxy
+
+        if getattr(Proxy, "_nfp_patched", False):
+            return  # Already patched
+
+        _original_generate = Proxy._generate_proxy_config
+
+        def _patched_generate(self, *args, **kwargs):
+            # Run the original regeneration first
+            result = _original_generate(self, *args, **kwargs)
+            # Re-apply all registered NFP domains
+            if _NFP_REGISTRY:
+                conf_path = os.path.join(self.nginx_directory, "proxy.conf")
+                try:
+                    for nfp_domain, nfp_port in list(_NFP_REGISTRY.items()):
+                        _patch_proxy_conf_in_file(conf_path, nfp_domain, nfp_port)
+                    print(f"[NFP] Proxy patch re-applied for: {list(_NFP_REGISTRY)}")
+                except Exception as exc:
+                    print(f"[NFP] Proxy patch re-apply warning: {exc}")
+            return result
+
+        Proxy._generate_proxy_config = _patched_generate
+        Proxy._nfp_patched = True
+        print("[NFP] Proxy._generate_proxy_config monkey-patched ✓")
+    except Exception as exc:
+        print(f"[NFP] Proxy monkey-patch failed (non-fatal): {exc}")
+
+
+def _patch_proxy_conf_in_file(proxy_conf: str, domain: str, port: int) -> None:
+    """Same as _patch_proxy_conf but operates on an explicit file path."""
+    if not os.path.exists(proxy_conf):
+        return
+    safe          = _safe_name(domain)
+    upstream_name = f"nextjs_{safe}"
+    upstream_block = (
+        f"upstream {upstream_name} {{\n"
+        f"\tserver 127.0.0.1:{port};\n"
+        f"\tkeepalive 32;\n"
+        f"}}\n"
+    )
+    map_entry = f"\t{domain} http://{upstream_name};"
+    content = open(proxy_conf).read()
+
+    # Skip if already correctly patched (avoid redundant writes)
+    if f"server 127.0.0.1:{port};" in content and f"{domain} http://{upstream_name}" in content:
+        return
+
+    content = re.sub(rf"upstream {re.escape(upstream_name)} \{{[^}}]*\}}\n?", "", content)
+    content = re.sub(rf"^\s*{re.escape(domain)}\s+127\.0\.0\.1;\s*\n?", "", content, flags=re.MULTILINE)
+    content = re.sub(rf"^\s*{re.escape(domain)}\s+http://\S+;\s*\n?", "", content, flags=re.MULTILINE)
+
+    first = re.search(r"^upstream \w+", content, re.MULTILINE)
+    if first:
+        content = content[:first.start()] + upstream_block + "\n" + content[first.start():]
+    else:
+        content = upstream_block + "\n" + content
+
+    content = content.replace(
+        "\tdefault http://site_not_found;",
+        f"{map_entry}\n\n\tdefault http://site_not_found;",
+        1,
+    )
+    socket = re.search(
+        r"(map \$actual_host \$socket_upstream_hash \{[^}]*?)(default http://site_not_found;)",
+        content, re.DOTALL,
+    )
+    if socket:
+        entry = f"\t{domain} http://{upstream_name};\n"
+        if entry.strip() not in content:
+            pos = socket.start(2)
+            content = content[:pos] + entry + "    " + content[pos:]
+
+    open(proxy_conf, "w").write(content)
+
+
+# ── Main nginx write/remove ───────────────────────────────────────────
 
 def _write_nginx(domain: str, port: int,
                  deployment_mode: str = "Full Stack",
                  backend_url: str = "") -> None:
     """
-    Full nginx routing setup. Steps:
-      1. Clean stale .nextjs.conf files
-      2. Write Proxy() state (upstreams dir + map.json)
-      3. Trigger NginxReloadManager → proxy.conf regenerated (domain present, port 80)
-      4. Patch proxy.conf → domain now points to port <port>
-      5. Reload nginx directly (not via NginxReloadManager) → patch takes effect
+    Configure nginx routing for a Next.js domain. Steps:
+      1. Clean stale .nextjs.conf files from old deploy approaches
+      2. Remove any Proxy() state files for this domain (map.json + upstreams/)
+         so Proxy() never adds a $actual_host entry for it
+      3. Patch proxy.conf directly with our custom upstream + map entries
+      4. Reload nginx directly (not via NginxReloadManager)
+      5. Register domain in _NFP_REGISTRY for the monkey-patch
     """
-    print(f"[NFP] Setting up nginx: {domain} → 127.0.0.1:{port}")
+    print(f"[NFP] Configuring nginx: {domain} → 127.0.0.1:{port}")
 
-    # 1. Remove stale files from old deploy approaches
+    # 1. Clean stale files
     _clean_stale_conf_files(domain)
 
-    # 2. Write Proxy() state — domain will survive future NginxReloadManager runs
-    _write_proxy_state(domain)
+    # 2. Remove any Proxy() state that would poison $actual_host map
+    _cleanup_proxy_state(domain)
 
-    # 3. Let NginxReloadManager regenerate proxy.conf with our domain
-    #    (it does a nginx reload here too, but with wrong port — that's OK)
-    _trigger_nginxreloadmanager_and_wait()
+    # 3. Patch proxy.conf
+    _patch_proxy_conf(domain, port)
 
-    # 4. Patch proxy.conf to correct port
-    _patch_proxy_conf_port(domain, port)
-
-    # 5. Reload nginx directly so the port patch takes effect
-    #    (does NOT go through NginxReloadManager, so proxy.conf stays patched)
+    # 4. Reload nginx directly (preserves our patch)
     _reload_nginx_direct()
 
-    print(f"[NFP] nginx routing configured: {domain} → 127.0.0.1:{port}")
+    # 5. Register for monkey-patch persistence
+    _NFP_REGISTRY[domain] = port
+
+    print(f"[NFP] nginx routing configured: {domain} → 127.0.0.1:{port} ✓")
 
 
 def _remove_nginx(domain: str) -> None:
     """Remove domain from nginx routing."""
     _clean_stale_conf_files(domain)
-    _remove_proxy_state(domain)
+    _cleanup_proxy_state(domain)
     _unpatch_proxy_conf(domain)
-    # NginxReloadManager will regenerate proxy.conf cleanly (domain removed from state)
+    _NFP_REGISTRY.pop(domain, None)
+    # Let NginxReloadManager do the final reload cleanly
     try:
         from agent.nginx_reload_manager import NginxReloadManager
         NginxReloadManager().request_reload(request_id=f"nfp-rm-{os.getpid()}")
@@ -607,7 +669,7 @@ def nfp_remove_frontend(name):
     return jsonify({"job": job_id, "status": "queued"})
 
 
-# ── Register blueprint ────────────────────────────────────────────────
+# ── Register blueprint + install monkey-patch ─────────────────────────
 
 def _register_blueprint():
     try:
@@ -628,3 +690,7 @@ def _register_blueprint():
 
 
 _register_blueprint()
+
+# Install the Proxy() monkey-patch so our upstream blocks survive
+# any future NginxReloadManager cycle automatically.
+_install_proxy_patch()
