@@ -32,12 +32,15 @@ _CONFIG_FILES       = ["next.config.js", "next.config.mjs", "next.config.ts", "n
 _STANDALONE_PATTERN = re.compile(r"""output\s*:\s*['"]standalone['"]""", re.IGNORECASE)
 
 _HEALTH_APP = textwrap.dedent("""\
- // Injected by next_frontend_provisioner — do not remove.
-// Uses NextResponse for Next.js 14 compatibility (Response.json not available).
-import { NextResponse } from 'next/server'
+    import { NextResponse } from 'next/server'
 
+// Injected by next_frontend_provisioner — do not remove.
+// Required for container health checks.
 export async function GET() {
-  return NextResponse.json({ status: 'ok', ts: Date.now() })
+  return NextResponse.json({
+    status: 'ok',
+    ts: Date.now(),
+  })
 }
 """)
 
@@ -86,9 +89,72 @@ def _inject_dockerfile(root: Path):
 
 # ── next.config.* ────────────────────────────────────────────────────
 
+def _inject_app_config(root: Path) -> None:
+    """
+    Copy app-config-example.ts → app-config.ts and force ENV = 'PROD'.
+
+    In PROD mode the app sets API_BASE_URL = '' (empty string), so all
+    API calls use relative paths (/api/...). nginx then proxies /api/*
+    to the Frappe backend — keeping everything on the same origin and
+    avoiding CORS entirely.
+
+    Without this fix:
+      - app-config.ts has ENV = 'DEV' committed to the repo
+      - DEV mode hardcodes API_BASE_URL = 'https://crmapp.evoq.app'
+      - Browser makes cross-origin calls → CORS blocks → Redux crash
+    """
+    config_dir  = root / "src" / "services" / "config"
+    example     = config_dir / "app-config-example.ts"
+    destination = config_dir / "app-config.ts"
+
+    if not example.exists():
+        # No example file — if app-config.ts exists, patch it in place
+        if destination.exists():
+            _force_prod_env(destination)
+            print(f"[NFP] app-config.ts patched: ENV forced to PROD (no example found)")
+        return
+
+    # Copy example → app-config.ts (always overwrite to pick up example changes)
+    shutil.copy2(example, destination)
+
+    # Force ENV = 'PROD' in the copied file
+    _force_prod_env(destination)
+    print(f"[NFP] app-config.ts: copied from example + ENV forced to PROD ✓")
+
+
+def _force_prod_env(config_path: Path) -> None:
+    """
+    Replace any `let ENV = '...'` or `const ENV = '...'` with PROD.
+    Handles single quotes, double quotes, and template literals.
+    """
+    content = config_path.read_text()
+    original = content
+
+    # Pattern: let/const/var ENV = 'DEV' | "DEV" | `DEV` | 'DEVELOPMENT' etc.
+    content = re.sub(
+        r"""((?:let|const|var)\s+ENV\s*=\s*)(['"`])[^'"`]*(['"`])""",
+        r"\g<1>'PROD'",
+        content,
+    )
+
+    # Also handle: ENV = 'DEV' without declaration keyword (assignment)
+    content = re.sub(
+        r"""((?<!\w)ENV\s*=\s*)(['"`])(?!==)[^'"`]*(['"`])""",
+        r"\g<1>'PROD'",
+        content,
+    )
+
+    if content != original:
+        config_path.write_text(content)
+
+
 def _inject_or_patch_next_config(root: Path, site_name: str):
-    # copy app-config file
-    shutil.copy2(root /"src" /"services" /"config" / "app-config-example.ts", root /"src" /"services" /"config" / "app-config.ts")
+    # ── app-config.ts: copy from example and force ENV = 'PROD' ──────
+    # In PROD mode the app uses relative API URLs (/api/...) which nginx
+    # proxies to the Frappe backend. This avoids hardcoding the backend
+    # URL in the build and fixes CORS errors from cross-origin API calls.
+    _inject_app_config(root)
+
     existing = _find_config(root)
 
     if existing is None:
