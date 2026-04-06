@@ -123,17 +123,11 @@ def _registry_save(registry: dict) -> None:
     os.replace(tmp, path)
 
 
-def _registry_add(domain: str, port: int,
-                   deployment_mode: str = "Full Stack",
-                   backend_url: str = "") -> None:
+def _registry_add(domain: str, port: int) -> None:
     reg = _registry_load()
-    reg[domain] = {
-        "port":            port,
-        "deployment_mode": deployment_mode,
-        "backend_url":     backend_url,
-    }
+    reg[domain] = port
     _registry_save(reg)
-    print(f"[NFP] Registry: {domain} → port {port} ({deployment_mode}) saved ✓")
+    print(f"[NFP] Registry: {domain} → port {port} saved ✓")
 
 
 def _registry_remove(domain: str) -> None:
@@ -144,13 +138,6 @@ def _registry_remove(domain: str) -> None:
         print(f"[NFP] Registry: {domain} removed ✓")
 
 
-def _registry_get_port(entry) -> int:
-    """Extract port from registry entry (supports both int and dict formats)."""
-    if isinstance(entry, dict):
-        return entry.get("port", 0)
-    return int(entry)  # legacy int format
-
-
 def _allocate_port(requested_port: int = 0) -> int:
     """
     Return a host port for a new site.
@@ -158,7 +145,7 @@ def _allocate_port(requested_port: int = 0) -> int:
     Otherwise auto-allocate the next free port from PORT_BASE.
     """
     reg = _registry_load()
-    used = set(_registry_get_port(v) for v in reg.values())
+    used = set(reg.values())
 
     if PORT_BASE <= requested_port <= PORT_MAX and requested_port not in used:
         return requested_port
@@ -338,8 +325,7 @@ def _patch_proxy_conf_all() -> None:
         return
 
     content = open(proxy_conf).read()
-    for domain, entry in registry.items():
-        port = _registry_get_port(entry)
+    for domain, port in registry.items():
         content = _apply_patch_to_content(content, domain, port)
 
     open(proxy_conf, "w").write(content)
@@ -436,168 +422,22 @@ def _install_proxy_patch() -> None:
         print(f"[NFP] Proxy monkey-patch skipped: {exc}")
 
 
-# ── Frontend Only nginx server block ─────────────────────────────────
-
-def _write_frontend_only_conf(domain: str, port: int, backend_url: str) -> None:
-    """
-    Write a dedicated nginx server block for Frontend Only mode to
-    /etc/nginx/conf.d/nfp-<safe>.conf.
-
-    This file is NOT managed by NginxReloadManager and survives every
-    proxy.conf regeneration cycle. It splits traffic:
-      /api/* /files/* /private/* → Frappe backend (backend_url)
-      everything else             → Next.js container (port)
-
-    A more specific server_name takes precedence over the wildcard
-    *.evoq.app block in proxy.conf — no conflict.
-    """
-    safe          = _safe_name(domain)
-    conf_path     = f"/etc/nginx/conf.d/nfp-{safe}.conf"
-    nginx_dir     = _nginx_dir()
-    backend       = backend_url.rstrip("/")
-
-    try:
-        from urllib.parse import urlparse
-        backend_host = urlparse(backend).netloc
-    except Exception:
-        backend_host = backend.replace("https://", "").replace("http://", "").split("/")[0]
-
-    conf = f"""# NFP: {domain} — Frontend Only
-# Managed by next_frontend_provisioner — do not edit manually.
-# /api/* /files/* /private/* → {backend}
-# everything else             → Next.js container port {port}
-
-upstream nfp_{safe} {{
-    server 127.0.0.1:{port};
-    keepalive 32;
-}}
-
-server {{
-    listen 443 ssl http2;
-    server_name {domain};
-
-    ssl_certificate         {nginx_dir}/hosts/*.evoq.app/fullchain.pem;
-    ssl_certificate_key     {nginx_dir}/hosts/*.evoq.app/privkey.pem;
-    ssl_trusted_certificate {nginx_dir}/hosts/*.evoq.app/chain.pem;
-
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:MozSSL:10m;
-    ssl_session_tickets off;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    resolver 8.8.8.8 8.8.4.4 valid=600s;
-
-    client_max_body_size 250M;
-    more_set_headers "X-Frame-Options: SAMEORIGIN";
-    more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";
-
-    # ── Frappe API + files → backend (same origin from browser) ──────
-    location ~* ^/(api|files|private|assets)/ {{
-        proxy_pass         {backend};
-        proxy_http_version 1.1;
-        proxy_set_header   Host              {backend_host};
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_read_timeout    60s;
-        proxy_connect_timeout 10s;
-    }}
-
-    # ── Frappe WebSocket (realtime) → backend ────────────────────────
-    location /socket.io {{
-        proxy_pass         {backend};
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade           $http_upgrade;
-        proxy_set_header   Connection        "upgrade";
-        proxy_set_header   Host              {backend_host};
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }}
-
-    # ── Next.js static assets (long-cached) ──────────────────────────
-    location /_next/static/ {{
-        proxy_pass http://nfp_{safe}/_next/static/;
-        add_header Cache-Control "public, max-age=31536000, immutable";
-        access_log off;
-    }}
-
-    # ── Everything else → Next.js ────────────────────────────────────
-    location / {{
-        proxy_pass         http://nfp_{safe};
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade           $http_upgrade;
-        proxy_set_header   Connection        "upgrade";
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_read_timeout    60s;
-        proxy_connect_timeout 10s;
-    }}
-}}
-"""
-    wrote = False
-    try:
-        open(conf_path, "w").write(conf)
-        wrote = True
-    except PermissionError:
-        r = subprocess.run(
-            ["sudo", "tee", conf_path],
-            input=conf, text=True, capture_output=True,
-        )
-        if r.returncode == 0:
-            wrote = True
-
-    if wrote:
-        print(f"[NFP] Frontend Only conf written: {conf_path} ✓")
-    else:
-        print(f"[NFP] WARNING: could not write {conf_path}")
-
-
-def _remove_frontend_only_conf(domain: str) -> None:
-    """Remove the dedicated Frontend Only nginx conf on teardown."""
-    safe      = _safe_name(domain)
-    conf_path = f"/etc/nginx/conf.d/nfp-{safe}.conf"
-    if os.path.exists(conf_path):
-        try:
-            os.remove(conf_path)
-        except PermissionError:
-            subprocess.run(["sudo", "rm", "-f", conf_path], check=False)
-        print(f"[NFP] Removed Frontend Only conf: {conf_path}")
-
-
 # ── Main nginx write/remove ───────────────────────────────────────────
 
-def _write_nginx(domain: str, port: int,
-                 deployment_mode: str = "Full Stack",
-                 backend_url: str = "") -> None:
+def _write_nginx(domain: str, port: int) -> None:
     """
-    Full nginx routing setup for a Next.js domain.
-
-    Frontend Only: writes /etc/nginx/conf.d/nfp-<safe>.conf — a
-    dedicated server block that proxies /api/* to the Frappe backend
-    and everything else to Next.js. This file survives NginxReloadManager
-    cycles entirely (it's not part of proxy.conf).
-
-    Full Stack: patches proxy.conf upstream map — all traffic goes to
-    the Next.js container.
+    Full nginx routing setup for a Next.js domain:
+      1. Clean stale files from old deploy approaches
+      2. Remove any poisoned Proxy() state (map.json / upstreams/)
+      3. Save to persistent registry (nfp_sites.json)
+      4. Patch proxy.conf directly
+      5. Reload nginx directly (not via NginxReloadManager)
     """
-    print(f"[NFP] Configuring nginx: {domain} → 127.0.0.1:{port} ({deployment_mode})")
+    print(f"[NFP] Configuring nginx: {domain} → 127.0.0.1:{port}")
     _clean_stale_conf_files(domain)
     _cleanup_proxy_state(domain)
-    _registry_add(domain, port, deployment_mode, backend_url)
-
-    if deployment_mode == "Frontend Only" and backend_url:
-        # Dedicated conf file — fully independent of proxy.conf
-        _write_frontend_only_conf(domain, port, backend_url)
-        # Also patch proxy.conf as a routing fallback
-        _patch_proxy_conf(domain, port)
-    else:
-        _patch_proxy_conf(domain, port)
-
+    _registry_add(domain, port)
+    _patch_proxy_conf(domain, port)
     _reload_nginx_direct()
     print(f"[NFP] nginx routing configured: {domain} → 127.0.0.1:{port} ✓")
 
@@ -606,10 +446,9 @@ def _remove_nginx(domain: str) -> None:
     """Remove domain from nginx routing."""
     _clean_stale_conf_files(domain)
     _cleanup_proxy_state(domain)
-    _remove_frontend_only_conf(domain)
-    _unpatch_proxy_conf(domain)
     _registry_remove(domain)
-    # Let NginxReloadManager do the final clean reload
+    _unpatch_proxy_conf(domain)
+    # Let NginxReloadManager do a clean reload (our domain is gone from registry)
     try:
         from agent.nginx_reload_manager import NginxReloadManager
         NginxReloadManager().request_reload(request_id=f"nfp-rm-{os.getpid()}")
@@ -770,7 +609,7 @@ def _nfp_deploy(name: str, repo: str, branch: str, port: int,
         )
 
         # 5. Configure nginx routing
-        _write_nginx(domain, host_port, deployment_mode, backend_url)
+        _write_nginx(domain, host_port)
 
         _job_model_finish(model, success=True)
         _press_callback(
