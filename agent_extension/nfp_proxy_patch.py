@@ -51,6 +51,13 @@ def _nfp_load_registry(nginx_directory: str) -> dict:
         return {}
 
 
+def _nfp_get_port(entry) -> int:
+    """Extract integer port from registry entry (supports both int and dict)."""
+    if isinstance(entry, dict):
+        return int(entry.get("port", 0))
+    return int(entry)
+
+
 def _nfp_apply_patches(proxy_conf_path: str, registry: dict) -> None:
     """
     Re-apply all NFP upstream blocks to proxy.conf after Proxy() regenerates it.
@@ -64,7 +71,11 @@ def _nfp_apply_patches(proxy_conf_path: str, registry: dict) -> None:
     content = open(proxy_conf_path).read()
     changed = False
 
-    for domain, port in registry.items():
+    for domain, entry in registry.items():
+        port = _nfp_get_port(entry)
+        if port == 0:
+            print(f"[NFP-wrapper] Skipping {domain}: could not extract port from {entry!r}", flush=True)
+            continue
         safe  = domain.replace(".", "_").replace("-", "_")
         uname = f"nextjs_{safe}"
 
