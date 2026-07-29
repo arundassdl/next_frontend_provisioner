@@ -52,14 +52,41 @@ def _get_server(doc) -> object:
         return frappe.get_doc("Server", bench.server)
 
 
-def _is_colocated(server) -> bool:
-    """True when Press controller and app server are on the same host."""
-    return (getattr(server, "private_ip", None) or "").strip() in (
-        "127.0.0.1", "localhost", "::1"
+def _local_agent_config_exists() -> bool:
+    """True when the agent's config.json is on THIS host — i.e. the Press
+    controller and the agent are co-located, so the agent web port (which binds
+    127.0.0.1 only) is reachable via loopback."""
+    import os
+    return any(
+        os.path.exists(p)
+        for p in ("/var/frappe/agent/config.json", "/home/frappe/agent/config.json")
     )
 
 
+def _is_colocated(server) -> bool:
+    """True when the Press controller and the agent are on the same host.
+
+    NOTE: the agent web server binds **127.0.0.1** only. A deployment may set
+    `Server.private_ip` to the docker-bridge address (e.g. 172.17.0.1, used so
+    bench *containers* can reach host MariaDB) — that address is NOT bound by the
+    loopback-only agent, so co-located installs must still reach it via 127.0.0.1.
+    Co-location is therefore detected by the presence of the agent config on this
+    host (or an explicit `nfp_agent_host` override), not by the private_ip value.
+    """
+    host_override = (frappe.conf.get("nfp_agent_host") or "").strip()
+    if host_override:
+        return host_override in ("127.0.0.1", "localhost", "::1")
+    if (getattr(server, "private_ip", None) or "").strip() in ("127.0.0.1", "localhost", "::1"):
+        return True
+    return _local_agent_config_exists()
+
+
 def _get_server_ip(server) -> str:
+    # Explicit override wins (multi-host deployments set this to the agent's
+    # reachable private IP; co-located installs can leave it unset).
+    host_override = (frappe.conf.get("nfp_agent_host") or "").strip()
+    if host_override:
+        return host_override
     if _is_colocated(server):
         return "127.0.0.1"
     for attr in ("private_ip", "ip"):

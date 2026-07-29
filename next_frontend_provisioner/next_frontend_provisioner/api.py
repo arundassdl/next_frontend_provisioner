@@ -128,6 +128,57 @@ def _assert_exists(site_name: str):
         )
 
 
+def _fetch_agent_registry(server):
+    """Return the agent's live {domain: port} registry, or None if unreachable."""
+    import requests
+    base, headers = provisioner._agent_conn(server)
+    try:
+        resp = requests.get(f"{base}/frontends", headers=headers, timeout=10)
+        return resp.json() if resp.ok else None
+    except Exception:
+        return None
+
+
+@frappe.whitelist()
+def reconcile_frontend_status():
+    """Reconcile `Nextjs Site.status` against the agent's actually-deployed
+    frontends (its persistent registry / running containers).
+
+    A record marked Running/Deploying whose domain is absent from the agent
+    registry has no live container — its status is corrected to `Stopped`.
+    Runs on the scheduler (see hooks.py) and is callable on demand. Idempotent.
+    """
+    frappe.only_for("System Manager")
+    fixed = []
+    registry_cache: dict = {}
+    sites = frappe.get_all(
+        "Nextjs Site",
+        filters={"status": ["in", ["Running", "Deploying"]]},
+        fields=["name", "site_name"],
+    )
+    for s in sites:
+        doc = frappe.get_doc("Nextjs Site", s.name)
+        try:
+            server = provisioner._get_server(doc)
+        except Exception:
+            continue
+        if server.name not in registry_cache:
+            registry_cache[server.name] = _fetch_agent_registry(server)
+        registry = registry_cache[server.name]
+        if registry is None:
+            continue  # agent unreachable — don't guess
+        domain = doc.site_name or doc.name
+        if domain not in registry:
+            frappe.db.set_value("Nextjs Site", s.name, "status", "Stopped")
+            provisioner._log_event(
+                s.name,
+                f"Reconcile: no container for {domain} (absent from agent registry) → Stopped",
+            )
+            fixed.append(s.name)
+    frappe.db.commit()
+    return {"reconciled": fixed}
+
+
 @frappe.whitelist()
 def debug_agent_connection(site_name: str):
     """

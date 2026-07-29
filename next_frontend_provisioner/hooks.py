@@ -33,3 +33,14 @@ doc_events.update({
         "on_trash": "next_frontend_provisioner.next_frontend_provisioner.press_hooks.on_nextjs_site_delete",
     }
 })
+
+# ── Scheduled tasks ──────────────────────────────────────────────────
+# Reconcile Nextjs Site.status against the agent's actually-deployed frontends,
+# so a record can never remain "Running" when its container is gone.
+scheduler_events = {
+    "cron": {
+        "*/10 * * * *": [
+            "next_frontend_provisioner.next_frontend_provisioner.api.reconcile_frontend_status",
+        ]
+    }
+}
