@@ -266,6 +266,35 @@ def _get_proxy_hosts() -> list:
         return []
 
 
+def _ensure_frontend_dns(domain: str) -> None:
+    """Create the Hetzner DNS CNAME for a frontend domain.
+
+    A Frontend-Only frontend has its own domain (e.g. crm-acme.evoq.app) that is
+    NOT a Press `Site`, so press_ext's Site `after_insert` DNS hook never fires
+    for it — without this the domain would not resolve. nfp runs on the same
+    bench as press_ext, so it creates the CNAME (domain → proxy_server) directly
+    through the same Hetzner Cloud API path. Non-fatal by design.
+    """
+    try:
+        if not domain or "." not in domain:
+            return
+        roots = frappe.get_all("Root Domain", filters={"dns_provider": "Hetzner"}, pluck="name")
+        root = next((r for r in roots if domain == r or domain.endswith("." + r)), None)
+        if not root:
+            return
+        proxy = frappe.db.get_value("Root Domain", root, "default_proxy_server")
+        if not proxy:
+            active = frappe.get_all("Proxy Server", filters={"status": "Active"}, pluck="name")
+            proxy = active[0] if active else None
+        if not proxy:
+            return
+        from press_ext.dns.hetzner import update_dns_records
+        update_dns_records(root, [domain], proxy)
+        frappe.logger("nfp").info(f"frontend DNS ensured: {domain} → {proxy}")
+    except Exception as exc:
+        frappe.log_error(title="nfp: _ensure_frontend_dns failed", message=f"{domain}: {exc}")
+
+
 def _get_callback_token() -> str:
     return frappe.conf.get("nfp_agent_callback_token", "")
 
@@ -350,6 +379,10 @@ def dispatch_provision(site_name: str):
     if not doc.container_port:
         doc.db_set("container_port", _allocate_port())
         doc.reload()
+
+    # Ensure the frontend domain resolves (Frontend-Only domains are not Press
+    # Sites, so nothing else creates their DNS record).
+    _ensure_frontend_dns(doc.site_name or site_name)
 
     base_url, headers = _agent_conn(server)
     slug = _slug(site_name)

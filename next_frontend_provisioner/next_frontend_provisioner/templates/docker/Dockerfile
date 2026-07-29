@@ -14,16 +14,20 @@ COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
 
 # Install with whichever lockfile is present.
 # --ignore-scripts skips postinstall hooks (e.g. build:icons) that
-# reference files not present at install time.
+#   reference files not present at install time.
+# --legacy-peer-deps makes npm tolerate peer-dependency conflicts (ERESOLVE),
+#   which modern npm (10+) rejects by default — many app repos with older
+#   lockfiles need this to install (it mirrors npm 6 behaviour).
 RUN \
   if [ -f yarn.lock ]; then \
     yarn install --frozen-lockfile --ignore-scripts; \
   elif [ -f package-lock.json ]; then \
-    npm ci --ignore-scripts; \
+    npm ci --ignore-scripts --legacy-peer-deps \
+      || npm install --ignore-scripts --legacy-peer-deps --no-audit; \
   elif [ -f pnpm-lock.yaml ]; then \
     corepack enable pnpm && pnpm install --frozen-lockfile --ignore-scripts; \
   else \
-    npm install --ignore-scripts --prefer-offline --no-audit; \
+    npm install --ignore-scripts --prefer-offline --no-audit --legacy-peer-deps; \
   fi
 
 # ── Stage 2: Build ────────────────────────────────────────────────────
